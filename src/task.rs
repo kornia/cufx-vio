@@ -15,10 +15,61 @@ use crate::reset::ResetEpoch;
 use crate::stats::{Durations, TrackerTiming};
 use crate::task_error::{Eye, TaskError};
 use crate::track::{TrackStatus, Tracker, TrackerConfig};
+use cu29::pool::{CuHandle, CuHostMemoryPool, CuPool};
 use cu29::prelude::*;
-use cufx_sensor_payloads::{RectifiedStereo, StereoPair, VioPose, VioStatus};
+use cufx_sensor_payloads::{Landmark, RectifiedStereo, StereoPair, VioPose, VioStatus};
 use kornia_3d::camera::PinholeCamera;
 use kornia_image::{Image, ImageSize};
+
+/// Most map points one [`VioPose::map_points`] snapshot carries.
+///
+/// The live map passes this within minutes; the snapshot keeps the NEWEST points (see
+/// [`Tracker::newest_live_map_points`]). At 16 bytes a point a full snapshot is 128 KiB, which
+/// is also what each pool buffer reserves, so a snapshot never reallocates.
+pub const MAX_LANDMARKS: usize = 8192;
+
+/// Default number of landmark snapshot buffers; the `landmark_buffers` key overrides it.
+///
+/// A snapshot stays checked out of the pool while anything holds its handle: the background
+/// wrapper's committed output, each copperlist slot that received it until that slot is
+/// reused, and any consumer that keeps a clone. Snapshots are taken on keyframes only, so few
+/// are alive at once; 16 is 2 MiB and covers a graph of 8 copperlists with a consumer that
+/// forwards the handle into its own. An exhausted pool drops the snapshot, never the pose.
+pub const DEFAULT_LANDMARK_BUFFERS: usize = 16;
+
+/// Largest `landmark_buffers` accepted: 256 buffers is 32 MiB.
+///
+/// The pool allocates every buffer up front, at 128 KiB each, so an unbounded key turns a
+/// typo into a startup allocation of gigabytes. 256 is 32 times the default, well past any
+/// copperlist count a graph needs.
+pub const MAX_LANDMARK_BUFFERS: usize = 256;
+
+/// Pool id reported in copper's pool statistics.
+const LANDMARK_POOL_ID: &str = "cufx_vio.landmarks";
+
+/// Fills a pooled snapshot from `points`, or returns `None` when every buffer is checked out.
+///
+/// The buffer is cleared and refilled in place: the pool hands back the same `Vec` with its
+/// capacity intact, so a steady state allocates nothing.
+fn snapshot_map_points(
+    pool: &CuHostMemoryPool<Vec<Landmark>>,
+    points: impl Iterator<Item = (usize, [f64; 3])>,
+) -> Option<CuHandle<Vec<Landmark>>> {
+    let handle = pool.acquire()?;
+    handle.with_inner_mut(|inner| {
+        let buf: &mut Vec<Landmark> = inner.as_mut();
+        buf.clear();
+        // An index past u32::MAX is four billion points into one map; skipped rather than
+        // wrapped onto an older point's index.
+        buf.extend(points.filter_map(|(idx, [x, y, z])| {
+            Some(Landmark {
+                position: [x as f32, y as f32, z as f32],
+                index: u32::try_from(idx).ok()?,
+            })
+        }));
+    });
+    Some(handle)
+}
 
 /// Resource bindings of [`StereoVio`], both provided by a [`VioBus`](crate::VioBus).
 #[doc(hidden)]
@@ -53,6 +104,22 @@ pub mod vio_resources {
 /// `ImuFeed`'s push is a single atomic load and the inertial path cannot start.
 ///
 /// Reset requests arrive the same way, through the bus's [`ResetEpoch`].
+///
+/// # Landmarks
+///
+/// A pose from a frame that inserted a keyframe carries [`VioPose::map_points`]: the live points
+/// among the newest [`MAX_LANDMARKS`] map slots, world frame, each with its map index. Every
+/// other pose carries `None`. Keyframes are the cadence because that is when the map changes:
+/// new points are created, old ones culled or fused and local bundle adjustment moves the rest,
+/// while a plain tracking frame only reads the map.
+///
+/// Each snapshot is the complete current view, so a consumer replaces what it displays with it:
+/// culled points drop out, and after a [`VioStatus::reset_epoch`] change the next snapshot
+/// describes the new world whether the map was rebuilt or kept. Until that snapshot arrives the
+/// displayed one belongs to the old epoch; a consumer that must not show it clears on the epoch
+/// change. Snapshot buffers come from a `CuHostMemoryPool` this task owns, sized by the
+/// `landmark_buffers` key (default [`DEFAULT_LANDMARK_BUFFERS`]); when it is exhausted the pose
+/// is published without its snapshot, and the stop line counts how often.
 #[derive(Reflect)]
 #[reflect(from_reflect = false)]
 pub struct StereoVio {
@@ -103,6 +170,12 @@ pub struct StereoVio {
     imu: Arc<ImuQueue>,
     #[reflect(ignore)]
     epoch: Arc<ResetEpoch>,
+    /// Buffers for [`VioPose::map_points`]; see the type docs.
+    #[reflect(ignore)]
+    landmark_pool: Arc<CuHostMemoryPool<Vec<Landmark>>>,
+    /// Keyframe poses published with a snapshot, and without one because the pool was empty.
+    landmark_snapshots: u64,
+    landmark_pool_exhausted: u64,
 }
 
 /// A no-op, following `cu_anynet::AnyNetStereo`, whose `Freezable` is empty because nothing it
@@ -170,6 +243,17 @@ impl CuTask for StereoVio {
         )?;
         let inertial = crate::config::optional_inertial(config)?;
         let vio_resources::Resources { imu, epoch } = resources;
+        let landmark_buffers =
+            crate::config::optional_positive_usize(config, crate::config::LANDMARK_BUFFERS)?
+                .unwrap_or(DEFAULT_LANDMARK_BUFFERS);
+        if landmark_buffers > MAX_LANDMARK_BUFFERS {
+            return Err(format!(
+                "`{}` must be at most {MAX_LANDMARK_BUFFERS} (128 KiB each, allocated up front), \
+                 got {landmark_buffers}",
+                crate::config::LANDMARK_BUFFERS
+            )
+            .into());
+        }
         if inertial.is_some() {
             // Declares the consumer. Until this runs the producer's push is a single atomic
             // load and no lock: the right state for every graph without this block.
@@ -212,6 +296,15 @@ impl CuTask for StereoVio {
             scratch_right: Vec::new(),
             imu,
             epoch,
+            // Built last, after every fallible config read above, so a refused config neither
+            // allocates the buffers nor registers the pool in copper's global statistics.
+            // Each buffer is filled to full length up front, so the pool reports its real
+            // footprint and a snapshot's `clear` + `extend` never grows it.
+            landmark_pool: CuHostMemoryPool::new(LANDMARK_POOL_ID, landmark_buffers, || {
+                vec![Landmark::default(); MAX_LANDMARKS]
+            })?,
+            landmark_snapshots: 0,
+            landmark_pool_exhausted: 0,
         })
     }
 
@@ -374,6 +467,27 @@ impl CuTask for StereoVio {
                 // Live points only, and cached by the tracker: a per-frame scan of every point
                 // ever created would be an unbounded per-frame cost for one status field.
                 let landmarks = tracker.live_map_points();
+                let map_points = if is_kf {
+                    let snapshot = snapshot_map_points(
+                        &self.landmark_pool,
+                        tracker.newest_live_map_points(MAX_LANDMARKS),
+                    );
+                    if snapshot.is_some() {
+                        self.landmark_snapshots += 1;
+                    } else {
+                        if self.landmark_pool_exhausted == 0 {
+                            // Once: a pool too small for the graph repeats every keyframe.
+                            warning!(
+                                "vio: landmark pool exhausted, publishing keyframe poses without \
+                                 a snapshot; raise `landmark_buffers`"
+                            );
+                        }
+                        self.landmark_pool_exhausted += 1;
+                    }
+                    snapshot
+                } else {
+                    None
+                };
                 let payload = VioPose {
                     cam_in_world,
                     status: VioStatus {
@@ -383,6 +497,7 @@ impl CuTask for StereoVio {
                         reset_epoch: tracker.world_generation(),
                         landmarks: u32::try_from(landmarks).unwrap_or(u32::MAX),
                     },
+                    map_points,
                 };
                 output.set_payload(payload);
             }
@@ -400,6 +515,10 @@ impl CuTask for StereoVio {
         info!(
             "vio: {} tracked, {} untracked",
             self.tracked, self.untracked
+        );
+        info!(
+            "vio: {} landmark snapshots, {} keyframes without one (pool exhausted)",
+            self.landmark_snapshots, self.landmark_pool_exhausted
         );
         // One structured line per population, each figure its own field, in milliseconds. NaN
         // marks an empty population, which is not the same thing as a zero-cost one.
@@ -503,6 +622,11 @@ mod tests {
                 .flat_map(|y| (0..W).map(move |x| texture(x + shift, y)))
                 .collect::<Vec<u8>>()
         };
+        pair_msg(eye(8), eye(0), tov)
+    }
+
+    /// A `W`x`H` pair on the test calibration (fx = fy = 300, 0.1 m baseline), stamped `tov`.
+    fn pair_msg(left: Vec<u8>, right: Vec<u8>, tov: Tov) -> CuMsg<StereoPair> {
         let calib = RectifiedStereo {
             fx: 300.0,
             fy: 300.0,
@@ -513,8 +637,8 @@ mod tests {
         let pair = StereoPair::new(
             W,
             H,
-            CuHandle::new_detached(eye(8)),
-            CuHandle::new_detached(eye(0)),
+            CuHandle::new_detached(left),
+            CuHandle::new_detached(right),
             calib,
         )
         .expect("valid pair");
@@ -608,6 +732,132 @@ mod tests {
         );
         task.process(&ctx, &frame(Tov::Time(CuTime::from_nanos(3))), &mut out)
             .expect("the original calibration is still accepted");
+    }
+
+    /// A frame the tracker can bootstrap on, unlike [`frame`]'s one-pixel noise: 2x2-pixel
+    /// cells so ORB finds corners at every pyramid level, and three depth bands so stereo
+    /// triangulates a 3-D structure. The same scene as `examples/stereo_vio.rs`, which tracks.
+    fn trackable_frame(seq: u32, tov: Tov) -> CuMsg<StereoPair> {
+        const BANDS: [u32; 3] = [16, 24, 32];
+        let texture = |x: u32, y: u32| {
+            let h = (x / 2).wrapping_mul(73_856_093) ^ (y / 2).wrapping_mul(19_349_663);
+            (h.wrapping_mul(2_654_435_761) >> 24) as u8
+        };
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        for y in 0..H {
+            let d = BANDS[((y / (H / 3)) as usize).min(2)];
+            let shift = seq.wrapping_mul(d / 8);
+            for x in 0..W {
+                left.push(texture(x.wrapping_add(shift), y));
+                right.push(texture(x.wrapping_add(d).wrapping_add(shift), y));
+            }
+        }
+        pair_msg(left, right, tov)
+    }
+
+    #[test]
+    fn test_keyframe_poses_and_only_they_carry_a_map_points_snapshot() {
+        let (mut task, _, _) = vio();
+        let ctx = CuContext::new_with_clock();
+        let (mut saw_snapshot, mut saw_plain_pose) = (false, false);
+        for seq in 0..6u32 {
+            let mut out = CuMsg::<VioPose>::default();
+            let tov = Tov::Time(CuTime::from_nanos(1_000_000 + u64::from(seq) * 66_000_000));
+            task.process(&ctx, &trackable_frame(seq, tov), &mut out)
+                .expect("frame");
+            let Some(pose) = out.payload() else { continue };
+            assert_eq!(
+                pose.map_points.is_some(),
+                pose.status.keyframe,
+                "the snapshot cadence is the keyframe cadence"
+            );
+            let Some(handle) = &pose.map_points else {
+                saw_plain_pose = true;
+                continue;
+            };
+            saw_snapshot = true;
+            let points = handle.with_inner(|v| v.to_vec());
+            assert!(
+                !points.is_empty(),
+                "a keyframe of a textured plane has points"
+            );
+            // Small map, so the newest-`MAX_LANDMARKS` window is the whole map: the snapshot
+            // must hold exactly the live points the status counts.
+            assert_eq!(points.len(), pose.status.landmarks as usize);
+            assert!(
+                points.windows(2).all(|w| w[0].index < w[1].index),
+                "indices are unique and ascending"
+            );
+            assert!(
+                points
+                    .iter()
+                    .all(|p| p.position.iter().all(|c| c.is_finite())),
+                "world positions are finite"
+            );
+        }
+        assert!(saw_snapshot, "the bootstrap frame inserts a keyframe");
+        assert!(
+            saw_plain_pose,
+            "a tracked non-keyframe pose must be exercised too, or the cadence is untested"
+        );
+        assert_eq!(task.landmark_pool_exhausted, 0);
+    }
+
+    #[test]
+    fn test_an_exhausted_landmark_pool_yields_no_snapshot_until_a_buffer_returns() {
+        let pool = CuHostMemoryPool::new("cufx_vio.test_landmarks", 1, || {
+            vec![Landmark::default(); 4]
+        })
+        .expect("pool");
+        let held = snapshot_map_points(&pool, [(3, [1.0, 2.0, 3.0])].into_iter())
+            .expect("one free buffer");
+        assert!(
+            snapshot_map_points(&pool, std::iter::empty()).is_none(),
+            "the only buffer is still checked out"
+        );
+        drop(held);
+        let again = snapshot_map_points(&pool, [(9, [4.0, 5.0, 6.0])].into_iter())
+            .expect("the buffer came back");
+        assert_eq!(
+            again.with_inner(|v| v.to_vec()),
+            vec![Landmark {
+                position: [4.0, 5.0, 6.0],
+                index: 9,
+            }],
+            "a recycled buffer holds only the new snapshot, not the previous fill"
+        );
+    }
+
+    fn vio_with_landmark_buffers(n: usize) -> CuResult<StereoVio> {
+        let mut cfg = ComponentConfig::new();
+        cfg.set(crate::config::LANDMARK_BUFFERS, n as u32);
+        StereoVio::new(
+            Some(&cfg),
+            vio_resources::Resources {
+                imu: Arc::new(ImuQueue::new()),
+                epoch: Arc::new(ResetEpoch::new()),
+            },
+        )
+    }
+
+    #[test]
+    fn test_zero_landmark_buffers_is_refused() {
+        assert!(
+            vio_with_landmark_buffers(0).is_err(),
+            "a pool of zero buffers would never snapshot"
+        );
+    }
+
+    #[test]
+    fn test_landmark_buffers_past_the_cap_is_refused() {
+        assert!(
+            vio_with_landmark_buffers(MAX_LANDMARK_BUFFERS).is_ok(),
+            "the cap itself is accepted"
+        );
+        assert!(
+            vio_with_landmark_buffers(MAX_LANDMARK_BUFFERS + 1).is_err(),
+            "every buffer is allocated up front, so the count is bounded"
+        );
     }
 
     #[test]

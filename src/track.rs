@@ -991,6 +991,31 @@ impl Tracker {
         self.live_map_points
     }
 
+    /// The live (not culled) points among the newest `cap` map-point slots, oldest first, each
+    /// as `(map-point index, world-frame position in metres)`.
+    ///
+    /// Newest, not all: kornia-slam's map is append-only, so the tail is the frontier being built
+    /// now, and walking only the tail keeps the cost at O(`cap`) however long the map has grown.
+    /// The result is a complete view of that window, meant to REPLACE the previous one: a point
+    /// culled or fused since is simply absent, and after a [`Tracker::world_generation`] change
+    /// (map dropped, or kept in a moved world) the window describes the new world. The index is
+    /// the point's position in [`Map::map_points`], stable while the generation holds.
+    pub fn newest_live_map_points(
+        &self,
+        cap: usize,
+    ) -> impl Iterator<Item = (usize, [f64; 3])> + '_ {
+        let mps = self.map.map_points();
+        let first = mps.len().saturating_sub(cap);
+        mps[first..]
+            .iter()
+            .enumerate()
+            .filter(|(_, mp)| !mp.culled)
+            .map(move |(i, mp)| {
+                let p = mp.position;
+                (first + i, [p.x, p.y, p.z])
+            })
+    }
+
     /// Hands raw IMU samples to the tracker, to be preintegrated into the edge between the next
     /// two keyframes.
     ///
@@ -2989,6 +3014,35 @@ mod tests {
         // Normally set by the first frame; set here because these tests never feed one.
         tracker.epoch_ns = Some(EPOCH_NS);
         tracker
+    }
+
+    /// The landmark snapshot window: the newest `cap` SLOTS, culled ones skipped rather than
+    /// backfilled from older slots, indices exactly as the map holds them.
+    #[test]
+    fn test_newest_live_map_points_windows_the_tail_and_skips_culled() {
+        let mut tracker = Tracker::new(
+            rectified_camera(),
+            TrackerConfig::new(Length::new::<meter>(0.075)),
+        );
+        for i in 0..10 {
+            let p = Vec3F64::new(i as f64, -(i as f64), 0.5 * i as f64);
+            tracker
+                .map
+                .push_map_point(kornia_slam::map::MapPoint::new(p, [0; 32], 0, [0; 3], 0));
+        }
+        tracker.map.map_points_mut()[2].mark_culled();
+        tracker.map.map_points_mut()[7].mark_culled();
+
+        let got: Vec<_> = tracker.newest_live_map_points(5).collect();
+        let want: Vec<_> = [5usize, 6, 8, 9]
+            .into_iter()
+            .map(|i| (i, [i as f64, -(i as f64), 0.5 * i as f64]))
+            .collect();
+        assert_eq!(got, want);
+
+        // A cap past the map's size is the whole live map.
+        assert_eq!(tracker.newest_live_map_points(100).count(), 8);
+        assert_eq!(tracker.newest_live_map_points(0).count(), 0);
     }
 
     /// Nothing in kornia-slam removes a keyframe, so an unbounded map is the shipped behaviour
