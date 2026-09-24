@@ -45,6 +45,6 @@ pub use feed::ImuFeed;
 pub use imu::{ImuGates, ImuWindowError, InertialConfig, InertialStats};
 pub use imu_channel::ImuQueue;
 pub use reset::ResetEpoch;
-pub use task::{DEFAULT_LANDMARK_BUFFERS, MAX_LANDMARKS, StereoVio};
+pub use task::{DEFAULT_LANDMARK_BUFFERS, MAX_LANDMARK_BUFFERS, MAX_LANDMARKS, StereoVio};
 pub use task_error::{Eye, TaskError};
 pub use track::{TrackStatus, TrackedPose, Tracker, TrackerConfig, TrackerStats};

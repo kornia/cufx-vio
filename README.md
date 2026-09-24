@@ -33,11 +33,11 @@ All from `cufx-sensor-payloads`. Time rides on the message `tov`, never in the p
 |---|---|---|
 | `StereoPair` | two `CuImage` eyes (`CuHandle`-backed buffers) plus `RectifiedStereo`: intrinsics and baseline of the rectified pair | capture time of the pair |
 | `ImuBatch<N>` | up to `N` `ImuSample`s (an upstream `cu_sensor_payloads::ImuPayload` plus its own capture time), oldest first, a cumulative `dropped` counter and a `camera_aligned` flag | `ImuBatch::tov()`, a `Tov::Range` over the samples |
-| `VioPose` | a `cu_spatial_payloads::Pose<f64>` (camera in world) plus `VioStatus`: keyframe flag, reset epoch, landmark count; and `landmarks`, an optional map snapshot, `Option<CuHandle<Vec<Landmark>>>`. An untracked frame carries no payload | the `tov` of the frame it was computed from |
+| `VioPose` | a `cu_spatial_payloads::Pose<f64>` (camera in world) plus `VioStatus`: keyframe flag, reset epoch, landmark count; and `map_points`, an optional map snapshot, `Option<CuHandle<Vec<Landmark>>>`. An untracked frame carries no payload | the `tov` of the frame it was computed from |
 | `Landmark` | one map point: world-frame `position: [f32; 3]` in metres and its map `index: u32` | element of a `VioPose` snapshot, no time of its own |
 
-`Landmark::index` is a `u32`, not a float in a fourth column: a consumer accumulates the map by
-upserting on it, and an `f32` is exact only to 2^24, past which two points would silently merge.
+`Landmark::index` is a `u32`, not a float in a fourth column: an `f32` is exact only to 2^24,
+past which two points would share an index.
 
 The eye geometry rides on `StereoPair`, so `StereoVio` is never told what the source already
 knows: the tracker is built on the first frame, and every later frame must match its size.
@@ -90,21 +90,6 @@ cnx: [
   serialised form), so a resim of a `background: true` graph reproduces it only from the start of
   a log; see Known limitations.
 
-### Landmarks
-
-`StereoVio` attaches a map snapshot to the pose of every frame that inserted a keyframe, and to
-no other: a keyframe is when points are created, culled and moved by local bundle adjustment,
-while a plain tracking frame only reads the map. The snapshot holds the live points among the
-newest `MAX_LANDMARKS` (8192) map slots, so its cost does not grow with the map. A consumer
-builds the whole map by upserting on `Landmark::index` and clears what it holds when
-`VioStatus::reset_epoch` changes, since the epoch changes when the map is rebuilt (the indices
-restart) and when a kept map is moved to a new world frame, and rebuilds from the next snapshot
-of the new epoch.
-
-The buffers come from a `CuHostMemoryPool` owned by the task, `landmark_buffers` of them
-(default 16, 128 KiB each). A snapshot stays checked out while anything holds its handle; when
-none is free the pose is published without one, and the stop line counts how often.
-
 Why the IMU does not ride a second input: `CuAsyncTask`, which `background: true` wraps a task
 in, accepts a single input message. And while a solve is running the background task refuses the
 arriving input, so an IMU batch bundled into the frame payload would be dropped along with most
@@ -121,6 +106,26 @@ cargo run --release --example stereo_vio_logreader -- <LOG_PATH> extract-copperl
 The second command dumps each copperlist as JSON: the `stereo` frame and the `vio` pose, each with
 its `tov`. Because the tracker runs in the background, a pose lands one or more copperlists after
 the frame it was computed from, and its `tov` is that frame's `tov`.
+
+### Map points
+
+`StereoVio` attaches a map snapshot, `VioPose::map_points`, to the pose of every frame that
+inserted a keyframe, and to no other: a keyframe is when points are created, culled, fused and
+moved by local bundle adjustment, while a plain tracking frame only reads the map.
+
+A snapshot is a bounded, newest-window view, not the whole map: the live points among the newest
+`MAX_LANDMARKS` (8192) map slots, refreshed on every keyframe, so its cost does not grow with the
+map. Each snapshot is complete for that window, and a consumer REPLACES what it displays with
+it. Culled and fused points therefore drop out, and after a `VioStatus::reset_epoch` change the
+next snapshot describes the new world whether the map was rebuilt or kept. `Landmark::index` is
+the point's map index, stable within an epoch: use it to correlate a point across snapshots, not
+to accumulate them. `VioStatus::landmarks` counts every live point, so it can exceed a
+snapshot's length once the map outgrows the window.
+
+The buffers come from a `CuHostMemoryPool` owned by the task, `landmark_buffers` of them
+(default 16, at most 256, 128 KiB each, all allocated at startup). A snapshot stays checked out
+while anything holds its handle; when none is free the pose is published without one, and the
+stop line counts how often.
 
 ## Inertial path
 
