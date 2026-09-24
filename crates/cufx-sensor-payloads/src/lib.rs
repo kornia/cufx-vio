@@ -451,9 +451,10 @@ pub struct VioStatus {
 pub struct Landmark {
     /// Position in the tracker's world frame (the frame of [`VioPose::cam_in_world`]), metres.
     pub position: [f32; 3],
-    /// The point's index in the tracker's map. Stable for the life of the map: a point keeps
-    /// its index while its position is refined, so a consumer upserts on it. It is NOT stable
-    /// across a [`VioStatus::reset_epoch`] change, where the map is rebuilt and indices restart.
+    /// The point's index in the tracker's map. Stable within one [`VioStatus::reset_epoch`]: a
+    /// point keeps its index while its position is refined, so a consumer upserts on it. An
+    /// epoch change either rebuilds the map, restarting the indices, or keeps it and moves the
+    /// world under it; a consumer cannot tell which, so it drops what it holds either way.
     pub index: u32,
 }
 

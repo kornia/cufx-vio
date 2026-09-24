@@ -998,8 +998,9 @@ impl Tracker {
     /// now, which is what a live viewer wants, and walking only the tail keeps the cost at
     /// O(`cap`) however long the map has grown. Culled points are skipped, since a consumer that
     /// upserts by index would otherwise keep them forever. The index is the point's position in
-    /// [`Map::map_points`], stable until the map is dropped (a change of
-    /// [`Tracker::world_generation`]).
+    /// [`Map::map_points`], stable while [`Tracker::world_generation`] holds. A generation change
+    /// either drops the map (indices restart) or keeps it in a moved world (a keep-map loss
+    /// re-bootstrap, an accepted inertial initialization); both invalidate what a consumer holds.
     pub fn newest_live_map_points(
         &self,
         cap: usize,

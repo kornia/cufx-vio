@@ -106,7 +106,8 @@ pub mod vio_resources {
 /// new points are created, old ones culled and local bundle adjustment moves the rest, while a
 /// plain tracking frame only reads the map. A consumer drops its accumulated points when
 /// [`VioStatus::reset_epoch`] changes and rebuilds from the next snapshot: that is the first
-/// pose of the new epoch after an explicit reset or a map bound, but after a tracking-loss
+/// pose of the new epoch after an explicit reset, a map bound or an accepted inertial
+/// initialization (which runs on a keyframe), but after a tracking-loss
 /// re-bootstrap it can be a few poses later, since the re-bootstrap frame itself is not
 /// published (see [`Tracker::process_stereo`]). Snapshot buffers come from a
 /// `CuHostMemoryPool` this task owns, sized by the `landmark_buffers` key (default

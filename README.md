@@ -97,8 +97,9 @@ no other: a keyframe is when points are created, culled and moved by local bundl
 while a plain tracking frame only reads the map. The snapshot holds the live points among the
 newest `MAX_LANDMARKS` (8192) map slots, so its cost does not grow with the map. A consumer
 builds the whole map by upserting on `Landmark::index` and clears what it holds when
-`VioStatus::reset_epoch` changes, since a new map restarts the indices, and rebuilds from the
-next snapshot of the new epoch.
+`VioStatus::reset_epoch` changes, since the epoch changes when the map is rebuilt (the indices
+restart) and when a kept map is moved to a new world frame, and rebuilds from the next snapshot
+of the new epoch.
 
 The buffers come from a `CuHostMemoryPool` owned by the task, `landmark_buffers` of them
 (default 16, 128 KiB each). A snapshot stays checked out while anything holds its handle; when
