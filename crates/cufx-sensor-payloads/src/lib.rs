@@ -11,7 +11,8 @@
 //!   frame, and a source can recycle its buffers through a `CuHostMemoryPool`.
 //! * Inertial samples are upstream [`ImuPayload`]s, batched in [`ImuBatch`] because an IMU runs
 //!   an order of magnitude faster than the camera.
-//! * The estimated pose is a [`cu_spatial_payloads::Pose<f64>`].
+//! * The estimated pose is a [`cu_spatial_payloads::Pose<f64>`]. Its optional map snapshot is
+//!   a pool-backed [`CuHandle`] too, for the same reason as the eyes.
 //!
 //! # Time lives on the envelope
 //!
@@ -23,9 +24,9 @@
 //!
 //! # Hand-written `Decode`
 //!
-//! Types that hold a [`CuImage`] or a [`Pose`] implement `Decode<()>` by hand: those two only
-//! implement `Decode<()>`, so the derive's generic `impl<C> Decode<C>` cannot be written over
-//! them. This follows `cu_anynet::StereoPair`. Every other trait is derived.
+//! Types that hold a [`CuImage`], a [`Pose`] or a [`CuHandle`] implement `Decode<()>` by hand:
+//! those only implement `Decode<()>`, so the derive's generic `impl<C> Decode<C>` cannot be
+//! written over them. This follows `cu_anynet::StereoPair`. Every other trait is derived.
 
 #![deny(missing_docs)]
 
@@ -439,11 +440,30 @@ pub struct VioStatus {
     pub landmarks: u32,
 }
 
+/// One point of the tracker's map, as carried by [`VioPose::landmarks`].
+///
+/// A struct rather than `[f32; 4]` with the index cast to a float: an `f32` holds integers
+/// exactly only up to 2^24, and a consumer that accumulates the map upserts BY this index, so a
+/// rounded index would silently merge two points into one. A `u32` is exact to 2^32.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
+pub struct Landmark {
+    /// Position in the tracker's world frame (the frame of [`VioPose::cam_in_world`]), metres.
+    pub position: [f32; 3],
+    /// The point's index in the tracker's map. Stable for the life of the map: a point keeps
+    /// its index while its position is refined, so a consumer upserts on it. It is NOT stable
+    /// across a [`VioStatus::reset_epoch`] change, where the map is rebuilt and indices restart.
+    pub index: u32,
+}
+
 /// One estimated pose.
 ///
 /// **Camera-in-world**, already inverted from the tracker's world-to-camera convention. The
 /// inversion happens once, at the type boundary: publishing the un-inverted pose looks like a
 /// plausible trajectory travelled in reverse.
+///
+/// `Default` is safe to call (no landmarks), unlike [`StereoPair`]'s.
 #[derive(Default, Debug, Clone, Encode, Serialize, Deserialize, Reflect)]
 #[reflect(from_reflect = false, no_field_bounds)]
 pub struct VioPose {
@@ -451,6 +471,17 @@ pub struct VioPose {
     pub cam_in_world: Pose<f64>,
     /// Tracker bookkeeping for this pose.
     pub status: VioStatus,
+    /// A snapshot of map points, or `None`. A viewer payload, not part of the estimate.
+    ///
+    /// When it is present and which points it holds is the PRODUCER's policy, documented on
+    /// the producing task: a snapshot is typically taken only on keyframes, where the map
+    /// changes, and capped to the newest points. A consumer accumulates snapshots by upserting
+    /// on [`Landmark::index`] and drops what it holds when [`VioStatus::reset_epoch`] changes.
+    ///
+    /// Behind a [`CuHandle`], so a producer can recycle the buffers through a
+    /// `CuHostMemoryPool` and a copperlist slot holds a refcount, not the snapshot.
+    #[reflect(ignore)]
+    pub landmarks: Option<CuHandle<Vec<Landmark>>>,
 }
 
 impl Decode<()> for VioPose {
@@ -458,6 +489,7 @@ impl Decode<()> for VioPose {
         Ok(Self {
             cam_in_world: Decode::decode(decoder)?,
             status: Decode::decode(decoder)?,
+            landmarks: Decode::decode(decoder)?,
         })
     }
 }
@@ -606,6 +638,7 @@ mod tests {
                 reset_epoch: 6,
                 landmarks: 9,
             },
+            landmarks: None,
         };
         let bytes = encode(&pose);
         const ONE: [u8; 8] = [0, 0, 0, 0, 0, 0, 0xf0, 0x3f];
@@ -621,6 +654,8 @@ mod tests {
             row(ZERO, ZERO, ZERO, ONE),
             // keyframe = false, reset_epoch, landmarks
             vec![0, 6, 9],
+            // no landmark snapshot: the Option tag alone
+            vec![0],
         ]
         .concat();
         assert_eq!(bytes, golden);
@@ -628,6 +663,70 @@ mod tests {
         let back: VioPose = decode(&bytes);
         assert_eq!(back.status, pose.status);
         assert_eq!(back.cam_in_world.to_matrix(), pose.cam_in_world.to_matrix());
+        assert!(back.landmarks.is_none());
+    }
+
+    #[test]
+    fn test_vio_pose_with_landmarks_golden_bytes() {
+        let points = vec![
+            Landmark {
+                position: [1.0, 2.0, 3.0],
+                index: 7,
+            },
+            Landmark {
+                position: [-1.0, 0.5, 4.0],
+                index: 300,
+            },
+        ];
+        let pose = VioPose {
+            cam_in_world: Pose::default(),
+            status: VioStatus {
+                keyframe: true,
+                reset_epoch: 2,
+                landmarks: 5,
+            },
+            landmarks: Some(CuHandle::new_detached(points.clone())),
+        };
+        let bytes = encode(&pose);
+        let head = encode(&pose.cam_in_world);
+        #[rustfmt::skip]
+        let tail: &[u8] = &[
+            1, 2, 5,                // keyframe = true, reset_epoch, landmarks
+            1,                      // Some: a snapshot follows
+            2,                      // two points
+            0x00, 0x00, 0x80, 0x3f, // x = 1.0
+            0x00, 0x00, 0x00, 0x40, // y = 2.0
+            0x00, 0x00, 0x40, 0x40, // z = 3.0
+            7,                      // index, varint
+            0x00, 0x00, 0x80, 0xbf, // x = -1.0
+            0x00, 0x00, 0x00, 0x3f, // y = 0.5
+            0x00, 0x00, 0x80, 0x40, // z = 4.0
+            251, 0x2c, 0x01,        // index = 300, varint u16 form
+        ];
+        assert_eq!(bytes, [head.as_slice(), tail].concat());
+
+        let back: VioPose = decode(&bytes);
+        assert_eq!(back.status, pose.status);
+        let got = back
+            .landmarks
+            .expect("the snapshot survives the round trip")
+            .with_inner(|v| v.to_vec());
+        assert_eq!(got, points);
+    }
+
+    #[test]
+    fn test_landmark_index_is_exact_past_f32_precision() {
+        // 2^24 + 1 is the first integer an f32 cannot hold: the reason the index is a u32.
+        let lm = Landmark {
+            position: [0.0; 3],
+            index: (1 << 24) + 1,
+        };
+        assert_eq!(decode::<Landmark>(&encode(&lm)), lm);
+    }
+
+    #[test]
+    fn test_vio_pose_default_carries_no_landmarks() {
+        assert!(VioPose::default().landmarks.is_none());
     }
 
     // --- behaviour ------------------------------------------------------------------------------
@@ -736,5 +835,12 @@ mod tests {
         assert_payload::<ImuBatch<32>>();
         assert_payload::<ImuPayload>();
         assert_payload::<VioPose>();
+    }
+
+    /// The pool bound: a `CuHostMemoryPool<Vec<Landmark>>` exists only for an `ElementType`.
+    #[test]
+    fn test_landmark_is_a_pool_element() {
+        fn assert_element<T: cu29::pool::ElementType>() {}
+        assert_element::<Landmark>();
     }
 }

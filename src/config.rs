@@ -221,8 +221,10 @@ macro_rules! config_keys {
     ($($name:ident => $lit:literal),+ $(,)?) => {
         $(#[doc = concat!("The `", $lit, "` config key.")]
         pub(crate) const $name: &str = $lit;)+
-        /// Every key [`StereoVio::new`](crate::StereoVio) reads.
-        pub(crate) const CONFIG_KEYS: &[&str] = &[$($lit),+];
+        /// Every key [`StereoVio`](crate::StereoVio) reads from its RON config, in declaration
+        /// order. Public and read-only, so an application can assert the list its own configs
+        /// are written against.
+        pub const CONFIG_KEYS: &[&str] = &[$($lit),+];
     };
 }
 
@@ -234,6 +236,7 @@ config_keys! {
     MAX_COVISIBLE_KEYFRAMES => "max_covisible_keyframes",
     PNP_LM_ITERATIONS => "pnp_lm_iterations",
     INERTIAL => "inertial",
+    LANDMARK_BUFFERS => "landmark_buffers",
 }
 
 /// Refuses a config key `task` does not read.

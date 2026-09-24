@@ -33,7 +33,11 @@ All from `cufx-sensor-payloads`. Time rides on the message `tov`, never in the p
 |---|---|---|
 | `StereoPair` | two `CuImage` eyes (`CuHandle`-backed buffers) plus `RectifiedStereo`: intrinsics and baseline of the rectified pair | capture time of the pair |
 | `ImuBatch<N>` | up to `N` `ImuSample`s (an upstream `cu_sensor_payloads::ImuPayload` plus its own capture time), oldest first, a cumulative `dropped` counter and a `camera_aligned` flag | `ImuBatch::tov()`, a `Tov::Range` over the samples |
-| `VioPose` | a `cu_spatial_payloads::Pose<f64>` (camera in world) plus `VioStatus`: keyframe flag, reset epoch, landmark count. An untracked frame carries no payload | the `tov` of the frame it was computed from |
+| `VioPose` | a `cu_spatial_payloads::Pose<f64>` (camera in world) plus `VioStatus`: keyframe flag, reset epoch, landmark count; and `landmarks`, an optional map snapshot, `Option<CuHandle<Vec<Landmark>>>`. An untracked frame carries no payload | the `tov` of the frame it was computed from |
+| `Landmark` | one map point: world-frame `position: [f32; 3]` in metres and its map `index: u32` | element of a `VioPose` snapshot, no time of its own |
+
+`Landmark::index` is a `u32`, not a float in a fourth column: a consumer accumulates the map by
+upserting on it, and an `f32` is exact only to 2^24, past which two points would silently merge.
 
 The eye geometry rides on `StereoPair`, so `StereoVio` is never told what the source already
 knows: the tracker is built on the first frame, and every later frame must match its size.
@@ -81,9 +85,24 @@ cnx: [
   frame. Unknown config keys are refused at startup rather than ignored. The recognised keys are
   `on_tracking_loss` (`keep_map`, the default, or `reset_map` for a long-running graph),
   `max_keyframes`, `orb_keypoints`, `search_radius_px`, `max_covisible_keyframes`,
-  `pnp_lm_iterations` and `inertial`. Its `Freezable` is a no-op (the kornia-slam map has no
+  `pnp_lm_iterations`, `inertial` and `landmark_buffers`; `cufx_vio::config::CONFIG_KEYS` lists
+  them. Its `Freezable` is a no-op (the kornia-slam map has no
   serialised form), so a resim of a `background: true` graph reproduces it only from the start of
   a log; see Known limitations.
+
+### Landmarks
+
+`StereoVio` attaches a map snapshot to the pose of every frame that inserted a keyframe, and to
+no other: a keyframe is when points are created, culled and moved by local bundle adjustment,
+while a plain tracking frame only reads the map. The snapshot holds the live points among the
+newest `MAX_LANDMARKS` (8192) map slots, so its cost does not grow with the map. A consumer
+builds the whole map by upserting on `Landmark::index` and clears what it holds when
+`VioStatus::reset_epoch` changes, since a new map restarts the indices, and rebuilds from the
+next snapshot of the new epoch.
+
+The buffers come from a `CuHostMemoryPool` owned by the task, `landmark_buffers` of them
+(default 16, 128 KiB each). A snapshot stays checked out while anything holds its handle; when
+none is free the pose is published without one, and the stop line counts how often.
 
 Why the IMU does not ride a second input: `CuAsyncTask`, which `background: true` wraps a task
 in, accepts a single input message. And while a solve is running the background task refuses the
