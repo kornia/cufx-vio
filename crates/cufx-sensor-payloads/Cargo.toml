@@ -1,0 +1,25 @@
+[package]
+name = "cufx-sensor-payloads"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Edgar Riba <edgar.riba@gmail.com>"]
+publish = false
+description = "Stereo, inertial and pose payloads for a Copper visual-inertial graph"
+repository = "https://github.com/kornia/cufx-vio"
+
+# The copper component catalog scrapes this.
+[package.metadata.copper]
+kind = "payload"
+domains = ["payload/sensor"]
+environments = ["host"]
+
+# INHERITED, NOT RESPELLED. Cargo keys a git source on the spec STRING, not the resolved commit,
+# and these types cross a copperlist: a second spelling of `cu29` is a second `CuMsg` and a
+# second `CuImage`. `workspace = true` is what makes that unspellable; see the root manifest.
+[dependencies]
+cu29 = { workspace = true }
+cu-sensor-payloads = { workspace = true }
+cu-spatial-payloads = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true }

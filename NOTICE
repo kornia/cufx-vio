@@ -1,0 +1,33 @@
+cufx-vio
+Copyright 2026 Edgar Riba
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+-------------------------------------------------------------------------------
+Algorithmic reference: ORB-SLAM3
+-------------------------------------------------------------------------------
+
+The design of the tracking pipeline in this repository (stereo initialisation,
+tracking against a local map, the keyframe insertion policy, and the staged
+visual-inertial initialisation with its inertial bundle-adjustment schedule)
+follows the algorithms described in:
+
+  C. Campos, R. Elvira, J. J. Gomez Rodriguez, J. M. M. Montiel and
+  J. D. Tardos, "ORB-SLAM3: An Accurate Open-Source Library for Visual,
+  Visual-Inertial, and Multimap SLAM", IEEE Transactions on Robotics,
+  vol. 37, no. 6, pp. 1874-1890, 2021.
+
+ORB-SLAM3 is a separate project distributed under the GNU General Public
+License, version 3. The ORB-SLAM3 paper and its public source code were
+consulted as a design reference. No ORB-SLAM3 source code is included in this
+repository.
+
+-------------------------------------------------------------------------------
+Estimation back end: kornia-slam
+-------------------------------------------------------------------------------
+
+The feature extraction, stereo matching, map, pose estimation and bundle
+adjustment used by this crate are provided by kornia-slam
+(https://github.com/kornia/kornia-slam) and kornia-rs
+(https://github.com/kornia/kornia-rs), both licensed under the Apache License,
+Version 2.0. They are consumed as dependencies and are not vendored here.

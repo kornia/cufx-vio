@@ -1,0 +1,66 @@
+// A self-contained stereo-VIO graph: synthetic stereo and IMU sources, the tracker in the
+// background, and a sink that logs every pose. Run it with `cargo run --example stereo_vio`.
+(
+    logging: (
+        enable_task_logging: true,
+        slab_size_mib: 64,
+        section_size_mib: 16,
+    ),
+    resources: [
+        (
+            id: "bus",
+            provider: "cufx_vio::VioBus",
+        ),
+    ],
+    tasks: [
+        (
+            id: "stereo",
+            type: "SyntheticStereo",
+        ),
+        (
+            id: "imu",
+            type: "SyntheticImu",
+        ),
+        (
+            id: "imu_feed",
+            type: "cufx_vio::ImuFeed<32>",
+            resources: {
+                "imu": "bus.imu",
+            },
+        ),
+        (
+            id: "vio",
+            type: "cufx_vio::StereoVio",
+            config: {
+                "on_tracking_loss": "reset_map",
+                "max_keyframes": 120,
+            },
+            resources: {
+                "imu": "bus.imu",
+                "epoch": "bus.reset_epoch",
+            },
+            background: true,
+        ),
+        (
+            id: "poses",
+            type: "PoseSink",
+        ),
+    ],
+    cnx: [
+        (
+            src: "stereo",
+            dst: "vio",
+            msg: "cufx_sensor_payloads::StereoPair",
+        ),
+        (
+            src: "imu",
+            dst: "imu_feed",
+            msg: "cufx_sensor_payloads::ImuBatch<32>",
+        ),
+        (
+            src: "vio",
+            dst: "poses",
+            msg: "cufx_sensor_payloads::VioPose",
+        ),
+    ],
+)

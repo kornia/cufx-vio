@@ -1,0 +1,17 @@
+target
+
+# Cargo.lock IS TRACKED, against the usual convention for a library, because without it this crate
+# does not build from a clean clone.
+#
+# Six deps are git branches: kornia-image/-3d/-algebra/-imgproc on kornia-rs `main`, and
+# kornia-slam/-sensors on kornia-slam `develop`. The four kornia-rs ones cannot be pinned with
+# `rev =` here: a downstream app that also names `kornia-image` spells it `branch = "main"`, and
+# cargo keys a git source on the spec STRING, so a `rev` here would be a second kornia-rs source
+# and a second `Image<u8,1>`. (`cu29` IS pinned by rev and unifies fine, because every consumer
+# spells that same rev: the rule is "must agree with every consumer", not "cannot pin".)
+#
+# Untracked, a clone resolves whatever those branches are that day, and the two repos do not move
+# in lockstep: a kornia-rs `main` that adds a field to a struct kornia-slam constructs breaks the
+# kornia-slam `develop` it is paired with. The lock holds a PAIR known to build together. A
+# consumer's own lock still wins (cargo ignores a dependency's lock), so this binds nothing
+# downstream.
