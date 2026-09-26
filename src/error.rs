@@ -1,4 +1,4 @@
-//! Typed errors for the cufx-vio tracking core.
+//! Typed errors for the cu-kornia-vio tracking core.
 //!
 //! thiserror only; `anyhow` is not used anywhere in this crate.
 

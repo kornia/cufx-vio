@@ -1,12 +1,15 @@
 [package]
-name = "cufx-sensor-payloads"
+name = "cu-stereo-payloads"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Edgar Riba <edgar.riba@gmail.com>"]
 publish = false
 description = "Stereo, inertial and pose payloads for a Copper visual-inertial graph"
-repository = "https://github.com/kornia/cufx-vio"
+repository = "https://github.com/kornia/cu-kornia-vio"
+readme = "../../README.md"
+keywords = ["copper", "stereo", "imu", "vio", "robotics"]
+categories = ["science::robotics"]
 
 # The copper component catalog scrapes this.
 [package.metadata.copper]

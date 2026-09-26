@@ -9,7 +9,7 @@
     resources: [
         (
             id: "bus",
-            provider: "cufx_vio::VioBus",
+            provider: "cu_kornia_vio::VioBus",
         ),
     ],
     tasks: [
@@ -23,17 +23,19 @@
         ),
         (
             id: "imu_feed",
-            type: "cufx_vio::ImuFeed<32>",
+            type: "cu_kornia_vio::ImuFeed<32>",
             resources: {
                 "imu": "bus.imu",
             },
         ),
         (
             id: "vio",
-            type: "cufx_vio::StereoVio",
+            type: "cu_kornia_vio::StereoVio",
             config: {
                 "on_tracking_loss": "reset_map",
                 "max_keyframes": 120,
+                "orb_keypoints": 400,
+                "pnp_lm_iterations": 5,
             },
             resources: {
                 "imu": "bus.imu",
@@ -50,17 +52,17 @@
         (
             src: "stereo",
             dst: "vio",
-            msg: "cufx_sensor_payloads::StereoPair",
+            msg: "cu_stereo_payloads::StereoPair",
         ),
         (
             src: "imu",
             dst: "imu_feed",
-            msg: "cufx_sensor_payloads::ImuBatch<32>",
+            msg: "cu_stereo_payloads::ImuBatch<32>",
         ),
         (
             src: "vio",
             dst: "poses",
-            msg: "cufx_sensor_payloads::VioPose",
+            msg: "cu_stereo_payloads::VioPose",
         ),
     ],
 )

@@ -5,20 +5,22 @@
 //! `StereoVio` has exactly one input because `cu29`'s `CuAsyncTask`, which is what
 //! `background: true` wraps a task in, is implemented only for
 //! `T: CuTask<Input<'i> = CuMsg<I>>`. A second edge would un-background the solve, and the solve
-//! costs p50 596 ms / p99 1020 ms against a 66 ms frame interval (measured on a Jetson Orin with
-//! an OAK-D at 640x400): inline, it holds every other task in the graph behind it.
+//! costs p50 53 ms / p99 91 ms, and p50 93 ms on a keyframe, against a 66 ms frame interval
+//! (measured on a Jetson Orin with an OAK-D at 640x400 with `orb_keypoints: 400` and
+//! `pnp_lm_iterations: 5`; the defaults, 1000 keypoints and 50 LM iterations, are slower):
+//! inline, it holds every other task in the graph behind it.
 //!
 //! Bundling the samples into the `StereoPair` payload keeps one input, and costs only ~2 % of the
 //! payload, but puts the inertial stream on the ONE edge that is designed to drop: `CuAsyncTask`
-//! discards the arriving input while the previous solve is `Running`, and again while `Waiting`
-//! for the length of that solve, so roughly nine frames in ten are refused, taking their samples
-//! with them, with the producer's drop counter reading 0 because the SOURCE dropped nothing.
+//! discards the input that arrives while the previous solve is `Running`, so about 28 % of frames
+//! are refused even tuned, taking their samples with them, with the producer's drop counter
+//! reading 0 because the SOURCE dropped nothing.
 //! `from_measurements` then turns the decimated remainder into a full-`dt` delta at the wrong
 //! magnitude. The inertial stream must not ride the dropping edge.
 //!
 //! So the samples travel beside the copperlist, through an [`ImuQueue`] shared as a resource of
 //! the [`VioBus`](crate::VioBus) bundle: [`ImuFeed`](crate::ImuFeed), an inline sink that sees
-//! every [`ImuBatch`](cufx_sensor_payloads::ImuBatch) the source emits, pushes into it, and
+//! every [`ImuBatch`](cu_stereo_payloads::ImuBatch) the source emits, pushes into it, and
 //! `StereoVio` drains it on the frame it is given.
 //!
 //! # What this costs
@@ -45,7 +47,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::imu::RawImuSample;
-use cufx_sensor_payloads::ImuSample;
+use cu_stereo_payloads::ImuSample;
 
 /// Samples held between drains. The tracker's own ring is sized the same way, and for the same
 /// interval; see the constant's doc.
@@ -113,8 +115,10 @@ impl ImuQueue {
     /// The lock this takes is shared with `ImuQueue::drain_with` on the backgrounded side, so
     /// an inline caller can wait on it. The wait is bounded by what the consumer does under it:
     /// one copy of the pending samples into the tracker's ring: at most [`CAPACITY`] samples,
-    /// in practice what arrived since the previous solve (~120 at 200 Hz and a 600 ms solve),
-    /// with no solve and no I/O inside. The consumer never holds it across a solve.
+    /// in practice what arrived since the previous drain, one drain per accepted frame (~13-40
+    /// at 200 Hz tuned: one 66 ms frame period after a tracking solve, up to three after a p99
+    /// keyframe solve; up to [`CAPACITY`] after a multi-second stall), with no solve and no I/O
+    /// inside. The consumer never holds it across a solve.
     ///
     /// A poisoned lock is ignored: the alternative is a panic in a graph task over a buffer the
     /// tracker's coverage gates already guard, since they refuse an interval whose samples went
@@ -150,8 +154,8 @@ impl ImuQueue {
     /// is the producer's count plus this queue's own evictions, which is the number
     /// [`crate::track::Tracker::push_imu`] wants, since both are holes in the same stream.
     /// Handing the consumer the iterator rather than filling a `Vec` for it means each sample is
-    /// copied once, from this deque into the tracker's ring; the lock is held for that
-    /// ~120-element copy, well under the producer's tick.
+    /// copied once, from this deque into the tracker's ring; the lock is held for that copy
+    /// (~20 samples typically), well under the producer's tick.
     ///
     /// `None` on a poisoned lock; the samples are then simply not delivered, and the coverage
     /// gates refuse the interval.
@@ -182,8 +186,8 @@ impl ImuQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cu_stereo_payloads::ImuPayload;
     use cu29::clock::CuTime;
-    use cufx_sensor_payloads::ImuPayload;
 
     fn batch(from_ns: u64, n: u64) -> impl Iterator<Item = ImuSample> {
         (0..n).map(move |i| ImuSample {

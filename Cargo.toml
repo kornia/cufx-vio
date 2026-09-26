@@ -2,7 +2,7 @@
 # types it produces, and making it depend on this crate to do so would put kornia-slam behind
 # every driver that feeds a VIO graph.
 [workspace]
-members = ["crates/cufx-sensor-payloads"]
+members = ["crates/cu-stereo-payloads"]
 
 # Hoisted because both members name them: the spec string is what cargo keys a git source on, so
 # two spellings of a copper-rs crate would be two `CuMsg` types and a copperlist that does not
@@ -27,14 +27,17 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 
 [package]
-name = "cufx-vio"
+name = "cu-kornia-vio"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Edgar Riba <edgar.riba@gmail.com>"]
 publish = false
 description = "Copper tasks wrapping kornia-slam stereo visual-inertial odometry"
-repository = "https://github.com/kornia/cufx-vio"
+repository = "https://github.com/kornia/cu-kornia-vio"
+readme = "README.md"
+keywords = ["copper", "vio", "slam", "stereo", "robotics"]
+categories = ["science::robotics", "computer-vision"]
 
 # The copper component catalog scrapes this.
 [package.metadata.copper]
@@ -47,10 +50,10 @@ cu29 = { workspace = true }
 cu-spatial-payloads = { workspace = true }
 # A CONSUMER THAT NAMES BOTH CRATES MUST SPELL THEM IDENTICALLY. This is a path dep here, so it
 # inherits this package's source: pulled from git, it resolves to
-# `(cufx-sensor-payloads, git+<this repo>?branch=main)`. A consumer that writes `branch = "main"`
-# for cufx-vio and `rev = "..."` for this one gets TWO packages at one sha and two `StereoPair`
+# `(cu-stereo-payloads, git+<this repo>?branch=main)`. A consumer that writes `branch = "main"`
+# for cu-kornia-vio and `rev = "..."` for this one gets TWO packages at one sha and two `StereoPair`
 # types, with an error naming the same path twice.
-cufx-sensor-payloads = { path = "crates/cufx-sensor-payloads" }
+cu-stereo-payloads = { path = "crates/cu-stereo-payloads" }
 
 # kornia: there is NO [patch] table. Cargo keys a git source on the exact spec string, so every
 # consumer of this crate must spell each spec identically (`branch = "develop"` for the two

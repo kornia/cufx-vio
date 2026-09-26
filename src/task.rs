@@ -15,9 +15,9 @@ use crate::reset::ResetEpoch;
 use crate::stats::{Durations, TrackerTiming};
 use crate::task_error::{Eye, TaskError};
 use crate::track::{TrackStatus, Tracker, TrackerConfig};
+use cu_stereo_payloads::{Landmark, RectifiedStereo, StereoPair, VioPose, VioStatus};
 use cu29::pool::{CuHandle, CuHostMemoryPool, CuPool};
 use cu29::prelude::*;
-use cufx_sensor_payloads::{Landmark, RectifiedStereo, StereoPair, VioPose, VioStatus};
 use kornia_3d::camera::PinholeCamera;
 use kornia_image::{Image, ImageSize};
 
@@ -45,7 +45,7 @@ pub const DEFAULT_LANDMARK_BUFFERS: usize = 16;
 pub const MAX_LANDMARK_BUFFERS: usize = 256;
 
 /// Pool id reported in copper's pool statistics.
-const LANDMARK_POOL_ID: &str = "cufx_vio.landmarks";
+const LANDMARK_POOL_ID: &str = "cu_kornia_vio.landmarks";
 
 /// Fills a pooled snapshot from `points`, or returns `None` when every buffer is checked out.
 ///
@@ -89,16 +89,18 @@ pub mod vio_resources {
 /// ONE input, deliberately. `cu29`'s `CuAsyncTask`, which is what `background: true` wraps a
 /// task in, is implemented only for `T: CuTask<Input<'i> = CuMsg<I>>`: a single message, not a
 /// pack. So a second input edge is what stands between this task and being backgrounded, and
-/// backgrounding is the whole point on a live graph: keyframe insertion costs 0.6-1.0 s against
-/// a 66 ms frame interval, and while this runs inline EVERY other task in the graph waits behind
-/// it. Measured on a Jetson Orin with an OAK-D at 640x400, an inline run published at 1.2 Hz from
-/// a camera producing 15.
+/// backgrounding is the whole point on a live graph: a frame that inserts a keyframe takes p50
+/// 93 ms even tuned (0.6-1.0 s before the ORB/PnP tuning) against a 66 ms frame interval, and
+/// while this runs inline EVERY other task in the graph waits behind it. Before that tuning, an
+/// inline run on a Jetson Orin with an OAK-D at 640x400 published at 1.2 Hz from a camera
+/// producing 15.
 ///
 /// The inertial samples do not ride a second input, and are not bundled into the frame payload
-/// either: `CuAsyncTask` refuses the arriving input while the previous solve is `Running` and
-/// again while `Waiting`, so at a 596 ms p50 solve against a 66 ms frame interval roughly nine
-/// frames in ten are dropped, and a payload-borne batch would be dropped with them. Samples
-/// arrive through the bus's [`ImuQueue`] instead, pushed by an inline
+/// either: `CuAsyncTask` refuses the arriving input while the previous solve is `Running`. The
+/// solve overruns the 66 ms frame interval on keyframes and at its tail, so even tuned
+/// (`orb_keypoints: 400`, `pnp_lm_iterations: 5`: 10.8 Hz of poses from 15 fps) about 28 % of
+/// frames are dropped, and a payload-borne batch would be dropped with them. Samples arrive
+/// through the bus's [`ImuQueue`] instead, pushed by an inline
 /// [`ImuFeed`](crate::ImuFeed); see [`crate::imu_channel`] for what that costs in replay
 /// fidelity. The queue is armed only when this task has an `inertial` block: without one,
 /// `ImuFeed`'s push is a single atomic load and the inertial path cannot start.
@@ -145,8 +147,8 @@ pub struct StereoVio {
     /// Keyframe budget from the RON config; `None` is unbounded.
     max_keyframes: Option<usize>,
     /// Tracking-cost knobs from the RON config; `None` keeps the tracker's own default.
-    /// `estimate_pose` is 96 ms of a 100 ms tracking step on a Jetson Orin, so these are the
-    /// only levers on the frame rate that do not touch kornia-slam.
+    /// `estimate_pose` was 96 ms of a 100 ms tracking step on a Jetson Orin before the ORB/PnP
+    /// tuning, so these are the only levers on the frame rate that do not touch kornia-slam.
     orb_keypoints: Option<usize>,
     search_radius_px: Option<f64>,
     max_covisible_keyframes: Option<usize>,
@@ -238,7 +240,7 @@ impl CuTask for StereoVio {
     {
         crate::config::deny_unknown_keys(
             config,
-            "cufx_vio::StereoVio",
+            "cu_kornia_vio::StereoVio",
             crate::config::CONFIG_KEYS,
         )?;
         let inertial = crate::config::optional_inertial(config)?;
@@ -805,7 +807,7 @@ mod tests {
 
     #[test]
     fn test_an_exhausted_landmark_pool_yields_no_snapshot_until_a_buffer_returns() {
-        let pool = CuHostMemoryPool::new("cufx_vio.test_landmarks", 1, || {
+        let pool = CuHostMemoryPool::new("cu_kornia_vio.test_landmarks", 1, || {
             vec![Landmark::default(); 4]
         })
         .expect("pool");
