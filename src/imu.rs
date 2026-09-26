@@ -48,7 +48,7 @@ use cu29::units::si::ratio::ratio;
 use cu29::units::si::time::second;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, Vec3F64};
-use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement};
+use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::initialization::ImuInitConfig;
 
 use crate::error::VioError;
@@ -280,6 +280,11 @@ pub struct ImuBufferStats {
     pub out_of_order: u64,
     /// Samples pushed out by the capacity bound before anything read them.
     pub evicted: u64,
+    /// Samples refused at ingest for a non-finite gyro or accel component. Each one leaves a
+    /// drop mark, so an interval straddling it is refused rather than integrated across the
+    /// hole: a NaN admitted into a factor would make kornia-slam refuse
+    /// every later BA write-back (`Map::apply_ba_update` validates every factor in the map).
+    pub non_finite: u64,
     /// Times the source's cumulative drop counter increased.
     pub drop_reports: u64,
 }
@@ -330,7 +335,9 @@ impl ImuBuffer {
     ///
     /// Returns how many samples were accepted. Samples whose stamp does not strictly advance
     /// are dropped and counted: the whole driver path preserves order but nothing asserts it,
-    /// and `from_measurements` would silently sort them into a plausible answer.
+    /// and `from_measurements` would silently sort them into a plausible answer. Samples with a
+    /// non-finite reading are dropped, counted and marked as a hole; see
+    /// [`ImuBufferStats::non_finite`].
     ///
     /// Takes an iterator, not a slice, so the samples can flow from the producer's payload (or
     /// the channel's deque) straight into this ring with no intermediate `Vec` — each one is
@@ -364,6 +371,19 @@ impl ImuBuffer {
                 && sample.stamp_ns <= last.stamp_ns
             {
                 self.stats.out_of_order += 1;
+                continue;
+            }
+            if !sample
+                .gyro
+                .iter()
+                .chain(&sample.accel)
+                .all(|v| v.is_finite())
+            {
+                self.stats.non_finite += 1;
+                // A hole at this stamp: the interval that would have integrated it is refused.
+                // Marked here, not deferred, so a later pending mark cannot land past it.
+                self.drop_marks.push_back(sample.stamp_ns);
+                self.pending_drop_mark = false;
                 continue;
             }
             if self.pending_drop_mark {
@@ -678,6 +698,10 @@ pub struct InertialStats {
     /// interval but not its integrated `dt`, and `vi_ba_schur` answers a singular covariance with
     /// a 1e6-diagonal information matrix rather than an error.
     pub refused_zero_dt: u64,
+    /// Intervals whose preintegration came back with a non-finite term. Should be unreachable
+    /// behind [`ImuBufferStats::non_finite`]; checked because the map admits such a factor and
+    /// then refuses every later `Map::apply_ba_update`, visual BA included, until the map drops.
+    pub refused_non_finite: u64,
     /// Intervals that passed every gate here but that `Map::apply_insertion` refused (an
     /// endpoint keyframe the map does not hold, a duplicate edge, a non-increasing interval).
     /// Unreachable from the tracker's own keyframe path; counted because the map validates.
@@ -689,7 +713,9 @@ pub struct InertialStats {
     pub init_accepted: u64,
     /// Initializations the solver accepted but the map refused to apply
     /// (`Map::apply_inertial_alignment`: a non-finite or invalid scale, rotation, velocity or
-    /// bias). The map is left untouched and the tracker stays visual-only.
+    /// bias). The map is left untouched. A refused INITIAL solve leaves the tracker visual-only
+    /// and is retried after `init_retry`; a refused refinement leaves it on the previous
+    /// initialization, and that refinement is not retried.
     pub init_apply_refused: u64,
     /// Whether visual-inertial initialization has succeeded.
     pub initialized: bool,
@@ -706,7 +732,7 @@ pub struct InertialStats {
 }
 
 impl InertialStats {
-    /// Every refused interval, whatever the reason. One sum, so a seventh refusal counter cannot
+    /// Every refused interval, whatever the reason. One sum, so another refusal counter cannot
     /// be added without this total seeing it.
     pub fn refused_total(&self) -> u64 {
         self.refused_dropped
@@ -715,8 +741,45 @@ impl InertialStats {
             + self.refused_no_samples
             + self.refused_bad_interval
             + self.refused_zero_dt
+            + self.refused_non_finite
             + self.refused_by_map
     }
+}
+
+/// Whether every term of a preintegration is finite: kornia-slam's private
+/// `valid_preintegration` (`mapping/map/ops/correction.rs`), minus its `dt >= 0` test, which the
+/// caller's stricter `dt > 0` gate already covers.
+///
+/// Mirrored because `Map::apply_insertion` does not run it and `Map::apply_ba_update` runs it
+/// over EVERY factor in the map: an admitted non-finite factor would not fail its own insertion
+/// but every later BA write-back, visual included, until the map drops.
+pub(crate) fn preintegration_is_finite(p: &PreintegratedImu) -> bool {
+    let vec = |v: Vec3F64| v.to_array().iter().all(|c| c.is_finite());
+    p.dt.is_finite()
+        && vec(p.delta_velocity)
+        && vec(p.delta_position)
+        && vec(p.bias.gyro)
+        && vec(p.bias.accel)
+        && [
+            p.calib.gyro_noise,
+            p.calib.accel_noise,
+            p.calib.gyro_bias_noise,
+            p.calib.accel_bias_noise,
+        ]
+        .iter()
+        .chain(&p.covariance)
+        .chain(&p.bias_covariance)
+        .all(|v| v.is_finite())
+        && [
+            p.delta_rotation,
+            p.d_rotation_d_bias_gyro,
+            p.d_velocity_d_bias_gyro,
+            p.d_velocity_d_bias_accel,
+            p.d_position_d_bias_gyro,
+            p.d_position_d_bias_accel,
+        ]
+        .iter()
+        .all(|m| m.is_finite())
 }
 
 /// How much the IMU itself was excited over an initialization window. OBSERVATION ONLY — nothing
@@ -933,6 +996,29 @@ mod tests {
         assert_eq!(buf.stats().buffered, 10);
     }
 
+    /// A non-finite reading is a hole, not a sample: dropped, counted, and the interval that
+    /// straddles it is refused — while an interval clear of it still integrates.
+    #[test]
+    fn test_a_non_finite_sample_is_dropped_and_refuses_its_interval() {
+        let mut buf = ImuBuffer::with_capacity(1024);
+        let mut batch = samples(1_000_000_000, 400);
+        batch[40].accel[1] = f64::NAN;
+        batch[41].gyro[2] = f64::INFINITY;
+        assert_eq!(buf.push(batch, 0), 398);
+        assert_eq!(buf.stats().non_finite, 2);
+        assert!(
+            buf.samples
+                .iter()
+                .all(|s| s.accel[1].is_finite() && s.gyro[2].is_finite())
+        );
+        assert!(matches!(
+            buf.window(1_000_000_000, 1_500_000_000, &gates())
+                .unwrap_err(),
+            ImuWindowError::DroppedSamples { .. }
+        ));
+        assert!(buf.window(1_300_000_000, 1_800_000_000, &gates()).is_ok());
+    }
+
     #[test]
     fn test_an_empty_or_inverted_interval_is_refused() {
         let mut buf = ImuBuffer::with_capacity(1024);
@@ -979,6 +1065,34 @@ mod tests {
             ..s
         };
         assert_eq!(before.to_measurement(epoch).timestamp, 0.0);
+    }
+
+    /// The mirror of kornia-slam's `valid_preintegration`: a clean integration passes, and one
+    /// non-finite reading makes `from_measurements` produce a delta the map would admit and BA
+    /// would then refuse — which this must catch.
+    #[test]
+    fn test_a_non_finite_reading_makes_the_preintegration_non_finite() {
+        let calib = ImuCalib {
+            gyro_noise: 1.6968e-4,
+            accel_noise: 2.0e-3,
+            gyro_bias_noise: 1.9393e-5,
+            accel_bias_noise: 3.0e-3,
+        };
+        let mut measurements: Vec<ImuMeasurement> = (0..=120)
+            .map(|i| ImuMeasurement {
+                timestamp: i as f64 * 0.005,
+                gyro: Vec3F64::new(0.0, 0.0, 0.05),
+                accel: Vec3F64::new(0.0, 9.81, 0.0),
+            })
+            .collect();
+        let integrate = |m: &[ImuMeasurement]| {
+            PreintegratedImu::from_measurements(ImuBias::default(), calib, m, 0.0, 0.6)
+        };
+        assert!(preintegration_is_finite(&integrate(&measurements)));
+        measurements[40].accel.y = f64::NAN;
+        let poisoned = integrate(&measurements);
+        assert!(poisoned.dt > 0.0, "dt alone does not see it");
+        assert!(!preintegration_is_finite(&poisoned));
     }
 
     // ── Window excitation ────────────────────────────────────────────────────

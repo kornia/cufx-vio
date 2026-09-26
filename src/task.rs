@@ -554,14 +554,26 @@ impl CuTask for StereoVio {
         {
             info!("vio: gyro prior unavailable on {} frames", n);
         }
+        // Only when non-zero, and lifetime counts (a map drop does not zero them): a refused
+        // write leaves nothing behind but a thinner map, and a refused BA a map left unrefined.
+        if let Some(t) = self.tracker.as_ref()
+            && (t.map_writes_refused() > 0 || t.ba_updates_refused() > 0)
+        {
+            warning!(
+                "vio: the map refused {} writes and {} local BA results",
+                t.map_writes_refused(),
+                t.ba_updates_refused()
+            );
+        }
         // Refusals are the number to watch: a refused interval leaves the keyframe pair
         // visual-only and no other trace anywhere, so a rate here is the only way to see an IMU
         // stream that has quietly stopped covering its intervals.
         if let Some(stats) = self.tracker.as_ref().and_then(|t| t.inertial_stats()) {
             info!(
                 "vio inertial: {} factors ({} retained, pinning {} raw samples), refused {} \
-                 (dropped {}, gap {}, sparse {}, empty {}, bad-interval {}, zero-dt {}, map {}); \
-                 samples {} accepted / {} out-of-order / {} evicted, {} drop reports; init {}/{} \
+                 (dropped {}, gap {}, sparse {}, empty {}, bad-interval {}, zero-dt {}, \
+                 non-finite {}, map {}); samples {} accepted / {} out-of-order / {} non-finite / \
+                 {} evicted, {} drop reports; init {}/{} \
                  accepted ({} refused by the map), initialized={} refine_1={} refine_2={}",
                 stats.factors_added,
                 stats.retained_factors,
@@ -573,9 +585,11 @@ impl CuTask for StereoVio {
                 stats.refused_no_samples,
                 stats.refused_bad_interval,
                 stats.refused_zero_dt,
+                stats.refused_non_finite,
                 stats.refused_by_map,
                 stats.buffer.accepted,
                 stats.buffer.out_of_order,
+                stats.buffer.non_finite,
                 stats.buffer.evicted,
                 stats.buffer.drop_reports,
                 stats.init_accepted,
