@@ -24,10 +24,10 @@ pub mod feed_resources {
 /// Pushes every [`ImuBatch`] it receives into the bus's [`ImuQueue`].
 ///
 /// A sink rather than a second input on `StereoVio`: the tracker must keep exactly one input to
-/// be backgrounded, and a backgrounded task refuses most of its inputs (see
-/// [`crate::imu_channel`]). This task runs inline, so it sees every batch, and the batches stay
-/// a logged graph edge. Until a `StereoVio` with an `inertial` block arms the queue, a push is a
-/// single atomic load.
+/// be backgrounded, and a backgrounded task refuses every input that arrives while a solve is
+/// running (about 28 % of frames even tuned; see [`crate::imu_channel`]). This task runs inline,
+/// so it sees every batch, and the batches stay a logged graph edge. Until a `StereoVio` with an
+/// `inertial` block arms the queue, a push is a single atomic load.
 ///
 /// `N` is the source's batch capacity; the RON names it, as in `cu_kornia_vio::ImuFeed<32>`.
 #[derive(Reflect)]

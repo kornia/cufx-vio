@@ -86,19 +86,20 @@ cnx: [
   frame. Unknown config keys are refused at startup rather than ignored. The recognised keys are
   `on_tracking_loss` (`keep_map`, the default, or `reset_map` for a long-running graph),
   `max_keyframes`, `orb_keypoints`, `search_radius_px`, `max_covisible_keyframes`,
-  `pnp_lm_iterations`, `inertial` and `landmark_buffers`; `cu_kornia_vio::config::CONFIG_KEYS` lists
-  them. Its `Freezable` is a no-op (the kornia-slam map has no
-  serialised form), so a resim of a `background: true` graph reproduces it only from the start of
-  a log; see Known limitations.
+  `pnp_lm_iterations`, `inertial` and `landmark_buffers`;
+  `cu_kornia_vio::config::CONFIG_KEYS` lists them. Its `Freezable` is a no-op (the kornia-slam
+  map has no serialised form), so a resim of a `background: true` graph reproduces it only from
+  the start of a log; see Known limitations.
 
 Why the IMU does not ride a second input: `CuAsyncTask`, which `background: true` wraps a task
 in, accepts a single input message. And while a solve is running the background task refuses the
 arriving input, so an IMU batch bundled into the frame payload would be dropped along with every
-refused frame. Measured on a Jetson Orin with an OAK-D at 640x400 and 15 fps (`orb_keypoints: 400`,
-`pnp_lm_iterations: 5`), tracking takes p50 53 ms / p99 91 ms and keyframe insertion p50 93 ms
-against a 66 ms frame interval, so poses come out at about 10.8 Hz and about 28 % of frames are
-refused. Those two keys are what the Wiring snippet sets; kornia-slam's own defaults (800
-keypoints, 50 LM iterations) are markedly slower and refuse more.
+refused frame. Measured on a Jetson Orin with an OAK-D at 640x400 and 15 fps
+(`orb_keypoints: 400`, `pnp_lm_iterations: 5`), tracking takes p50 53 ms / p99 91 ms, and a
+frame that inserts a keyframe p50 93 ms, against a 66 ms frame interval, so poses come out at
+about 10.8 Hz and about 28 % of frames are refused. Those two keys are what the Wiring snippet
+sets; without them the tracker runs 1000 ORB keypoints (`TrackerConfig::new`) and kornia-slam's
+50 PnP LM iterations, which are markedly slower and refuse more.
 
 `examples/stereo_vio.ron` is a complete graph on synthetic input:
 
@@ -151,7 +152,8 @@ config: {
 },
 ```
 
-The rustdoc of `cu_kornia_vio::config` explains each field and why no default is defensible.
+The doc comments on `InertialRon` in `src/config.rs` explain each field and why no default is
+defensible (the type is crate-private, so `cargo doc` does not render them).
 
 ## Documentation and development
 
@@ -189,8 +191,9 @@ known to compile together. A consumer's own lock still wins.
 
 ## Known limitations
 
-- **Background only.** `StereoVio` is designed for `background: true`. A keyframe insertion costs
-  0.6-1.0 s, so inline it stalls every other task in the graph for that long.
+- **Background only.** `StereoVio` is designed for `background: true`: inline, every other task
+  in the graph waits behind each solve, and a frame that inserts a keyframe takes p50 93 ms even
+  tuned (see [Wiring](#wiring)) against a 66 ms frame interval.
 - **No map persistence or resim.** The kornia-slam map has no serialised form, so `StereoVio`'s
   `Freezable` is a no-op. A resim reproduces the task only from the start of a log, never from a
   mid-log keyframe, and a map cannot be saved or reloaded across runs.

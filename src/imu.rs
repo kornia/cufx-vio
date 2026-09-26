@@ -111,10 +111,13 @@ impl From<cu_stereo_payloads::ImuSample> for RawImuSample {
 /// 2048 = 10.2 s at 200 Hz, ~115 kB. Sized against the LONGEST interval that can be asked for,
 /// not the frame interval: a keyframe edge spans back to the previous keyframe, which on a
 /// parked robot has been measured 600-670 ms back, and the channel has to hold what arrives while
-/// the tracker is mid-solve and not draining (keyframe insertion p99 ~120 ms tuned). 10.2 s is
-/// margin over both, not a bound: an edge whose start has already been evicted is refused as a
-/// leading gap and that keyframe pair stays visual-only, never integrated over a hole. One
-/// constant for both rings so they cannot drift apart in size with nothing noticing.
+/// the tracker is mid-solve and not draining (a frame that inserts a keyframe: p50 ~93 ms /
+/// p99 ~200 ms tuned, with multi-second outliers). 10.2 s is margin over both, not a bound: an
+/// edge whose start the tracker's ring evicted is refused as a leading gap, and samples the
+/// channel evicted during a longer stall are folded into the drop count and refused as dropped
+/// samples (`refused_dropped`); either way that keyframe pair stays visual-only, never
+/// integrated over a hole. One constant for both rings so they cannot drift apart in size with
+/// nothing noticing.
 pub const DEFAULT_BUFFER_CAPACITY: usize = 2048;
 
 /// Appends to a capacity-bounded ring, evicting the oldest sample and counting the eviction.
