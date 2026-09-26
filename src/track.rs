@@ -2,11 +2,12 @@
 //!
 //! This module is the **composition root** over `kornia-slam`'s public API.
 //! `kornia-slam` ships the algorithms (stereo matching, map-projection PnP,
-//! bundle adjustment, the map itself) but its orchestration lives in
-//! `examples/orb_slam/src/pipeline.rs`, a `publish = false` binary crate with no
-//! `lib.rs` — unreachable as a dependency. `kornia-slam` is read-only for us, so
-//! the *logic* of that pipeline is re-implemented here for a live stereo camera.
-//! Nothing is vendored.
+//! bundle adjustment, the map itself) but its own orchestration,
+//! `kornia_slam::SlamSystem`, keeps its tracking state (`SystemState`,
+//! `SystemMode`) and inertial schedule crate-private and cannot be driven piece
+//! by piece. `kornia-slam` is read-only for us, so the *logic* of that
+//! orchestration is re-implemented here for a live stereo camera, over the
+//! map's public mutation API. Nothing is vendored.
 //!
 //! # Pose convention
 //!
@@ -49,7 +50,7 @@
 //! [`TrackerConfig::inertial`] is `None` unless the caller supplies a full
 //! camera-to-IMU extrinsic and the four IMU noise densities, and with it `None`
 //! this module is byte-for-byte the stereo-only tracker it has always been: no
-//! buffer is allocated, `Map::add_imu_factor` is never called, local BA stays on
+//! buffer is allocated, no IMU factor is ever inserted into the map, local BA stays on
 //! `run_local_ba`, and [`Tracker::push_imu`] refuses.
 //!
 //! It is off by default because an OAK-D answers `imu_to_camera_extrinsics` with
@@ -84,22 +85,31 @@ use kornia_imgproc::features::{
 use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, PreintegratedImu};
 use kornia_slam::Frame;
-use kornia_slam::estimation::imu_init::ImuInitResult;
-use kornia_slam::estimation::map_projection::{MapProjectionConfig, MapProjectionRejectReason};
-use kornia_slam::estimation::pnp::{self, PnpConfig};
-use kornia_slam::estimation::two_view::TwoViewInitConfig;
-use kornia_slam::estimation::{ImuInitializer, MapProjectionEstimator};
-use kornia_slam::map::{Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR, TriangulatedPoint};
-use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches, unproject_stereo};
-use kornia_slam::system::{
-    KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingStatus,
+use kornia_slam::TrackingStatus;
+use kornia_slam::initialization::two_view::TwoViewInitConfig;
+use kornia_slam::initialization::{AlignedTrackingState, ImuInitResult, ImuInitializer};
+use kornia_slam::mapping::bundle_adjustment::{run_local_ba, run_local_inertial_ba};
+use kornia_slam::mapping::culling::cull_landmarks;
+use kornia_slam::mapping::growth::accepted_pair_claims;
+use kornia_slam::mapping::map::{
+    ImuFactor, Keyframe, LandmarkSeed, Map, MapInsertion, ORB_N_LEVELS, ORB_SCALE_FACTOR,
+    ObservationKey,
 };
-use kornia_slam::tracking::{LocalMapSelectionConfig, select_local_map_points};
+use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches, unproject_stereo};
+use kornia_slam::tracking::local_map::landmarks_in_frustum;
+use kornia_slam::tracking::pose_estimation::map_projection::{
+    MapProjectionConfig, MapProjectionRejectReason,
+};
+use kornia_slam::tracking::pose_estimation::pnp::{self, PnpConfig};
+use kornia_slam::tracking::{
+    KeyframePolicy, LocalMapSelectionConfig, MapProjectionEstimator, TrackingLossRecoveryPolicy,
+    select_local_map_points,
+};
 
 use crate::error::VioError;
 use crate::imu::{
     ImuBuffer, ImuWindowError, InertialConfig, InertialStats, RawImuSample, WindowExcitation,
-    ts_sec, window_excitation,
+    preintegration_is_finite, ts_sec, window_excitation,
 };
 use cu_stereo_payloads::ImuSample;
 
@@ -120,10 +130,10 @@ pub const DEFAULT_MIN_BOOTSTRAP_STEREO_POINTS: usize = 50;
 /// map-point associations and PnP back onto the EXISTING map, instead of surrendering the
 /// map to a re-bootstrap. Thresholds are provisional — mirrored from the tracking-path
 /// gates where analogous; revisit against a measured loss corpus. When that corpus exists,
-/// candidate retrieval should move to `kornia_slam::place_recognition` (BoW, handles the
+/// candidate retrieval should move to `kornia_slam::loop_closure::place_recognition` (BoW, handles the
 /// post-drift/kidnap cases distance ordering cannot) and the matcher to
 /// `match_orb_descriptors` (ratio + orientation gates); the estimator itself is
-/// upstream-shaped (`kornia_slam::estimation`) once measured.
+/// upstream-shaped (`kornia_slam::tracking::pose_estimation`) once measured.
 #[derive(Debug, Clone)]
 pub struct RelocConfig {
     /// Candidate keyframes per attempt, ordered by camera-centre distance to the last known
@@ -175,7 +185,8 @@ const EPIPOLAR_CHI2: f64 = 3.84;
 const FUSE_SEARCH_RADIUS_PX: f32 = 7.0;
 /// Fuse pass: descriptor distance ceiling.
 const FUSE_MAX_HAMMING: u32 = 50;
-/// How many trailing keyframes `Map::run_local_ba` leaves free (its private
+/// How many trailing keyframes `kornia_slam::mapping::bundle_adjustment::run_local_ba`
+/// leaves free (its private
 /// `MAX_ACTIVE_KFS`). Mirrored here only to know when at least one pose is
 /// *fixed*, i.e. when the BA gauge is anchored — see the call site. If upstream
 /// changes its constant, BA here simply starts one keyframe early or late; it
@@ -199,7 +210,7 @@ pub struct TrackerConfig {
     pub baseline: Length,
     /// ORB detector used for both eyes.
     ///
-    /// `downscale` / `n_scales` are pinned to `kornia_slam::map`'s
+    /// `downscale` / `n_scales` are pinned to `kornia_slam::mapping::map`'s
     /// `ORB_SCALE_FACTOR` / `ORB_N_LEVELS` by [`TrackerConfig::new`]: the stereo
     /// coordinate mapping, the scale-invariance gates and the epipolar sigma all
     /// read those constants independently, and a mismatch is silent.
@@ -235,7 +246,7 @@ pub struct TrackerConfig {
     pub reset_map_on_loss: bool,
     /// Drop the map once it holds this many keyframes. `None` is unbounded.
     ///
-    /// kornia-slam never removes a keyframe — `Map::cull` only marks map points, and
+    /// kornia-slam never removes a keyframe — `cull_landmarks` only retires map points, and
     /// `keyframes`/`map_points` are `Vec`s that only push — so insertion cost rises without
     /// limit. Measured on a Jetson Orin with an OAK-D at 640x400: 62 ms at 25 keyframes, 260 ms
     /// at 137, 427 ms at 156, then a silent stall (one thread at 99.9 %, 757 MB RSS, zero poses
@@ -258,7 +269,7 @@ pub struct TrackerConfig {
 impl TrackerConfig {
     /// Builds a config for a rectified pair with the given metric baseline.
     pub fn new(baseline: Length) -> Self {
-        // Upstream's `PipelineConfig::default` tightens two triangulation
+        // Upstream's `SlamConfig::default` tightens two triangulation
         // thresholds relative to kornia-3d's defaults; both feed the growth pass.
         let mut two_view_init = TwoViewInitConfig::default();
         two_view_init.triangulation_config.max_midpoint_gap = 0.25;
@@ -385,19 +396,113 @@ impl Default for TrackerStats {
     }
 }
 
+/// Which stage the tracker is in.
+///
+/// Owned here since kornia-slam made its own `SystemMode` crate-private. It mirrors that enum
+/// minus `ImuInit`: kornia-slam's `SlamSystem` parks in `ImuInit` and stops tracking until the
+/// inertial initialization succeeds, whereas this tracker keeps tracking visually throughout and
+/// runs the initializer as a side effect of keyframe insertion, so it never entered that mode
+/// (the arm that handled it was an unreachable recovery path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemMode {
+    /// Waiting for a usable stereo frame to anchor on: before the first map, or after a tracking
+    /// loss. After a loss the old map is still served; the re-anchor appends to it
+    /// ([`TrackerConfig::reset_map_on_loss`] off, the default) or starts a fresh one (on).
+    Bootstrap,
+    /// Track against the existing map and insert keyframes when needed.
+    Tracking,
+}
+
+/// Mutable tracker state carried across frames.
+///
+/// Owned here since kornia-slam made its own `SystemState` crate-private. The fields and
+/// [`SystemState::reset`] are kornia-slam's (develop `c94e2a8`, `system/state.rs`), minus the
+/// monocular `bootstrap_frame`, which a single-frame stereo bootstrap never holds.
+#[derive(Debug, Clone)]
+struct SystemState {
+    pose_world_to_cam: Pose3d,
+    /// Constant-velocity motion model, `Pose3d::between(previous, current)`.
+    velocity: Option<Pose3d>,
+    /// Metric body velocity in the world frame (m/s); valid once `imu_initialized`, when it
+    /// seeds each new keyframe (see `Tracker::seeded_keyframe`).
+    velocity_world: Vec3F64,
+    /// Timestamp of the previous processed frame. Written for parity with kornia-slam's state,
+    /// where it bounds the per-frame preintegration window; nothing here reads it.
+    #[allow(dead_code)]
+    last_frame_timestamp_sec: f64,
+    /// Whether visual-inertial initialization has been applied (selects inertial local BA).
+    imu_initialized: bool,
+    /// Timestamp (sec) at which inertial initialization was applied.
+    #[cfg_attr(not(test), allow(dead_code))]
+    imu_init_timestamp_sec: Option<f64>,
+    /// Reference keyframe tracking runs against (ORB-SLAM3's `mpReferenceKF`).
+    current_keyframe_idx: Option<usize>,
+    /// Most recently inserted keyframe (ORB-SLAM3's `mpLastKeyFrame`); spaces keyframe
+    /// insertion and anchors the next IMU edge.
+    last_keyframe_idx: Option<usize>,
+    /// Timestamp (sec) of the first frame in the current run of tracking failures, or `None`
+    /// while tracking is healthy.
+    lost_since_sec: Option<f64>,
+    mode: SystemMode,
+}
+
+impl SystemState {
+    fn new() -> Self {
+        Self {
+            pose_world_to_cam: Pose3d::IDENTITY,
+            velocity: None,
+            velocity_world: Vec3F64::ZERO,
+            last_frame_timestamp_sec: 0.0,
+            imu_initialized: false,
+            imu_init_timestamp_sec: None,
+            current_keyframe_idx: None,
+            last_keyframe_idx: None,
+            lost_since_sec: None,
+            mode: SystemMode::Bootstrap,
+        }
+    }
+
+    /// Back to bootstrap, KEEPING `pose_world_to_cam` (the re-bootstrap re-anchors there,
+    /// appending to the kept map) and `last_frame_timestamp_sec`. Clears the metric IMU state:
+    /// the map it applied to is about to be re-anchored, so inertial initialization has to run
+    /// again.
+    fn reset(&mut self) {
+        self.mode = SystemMode::Bootstrap;
+        self.current_keyframe_idx = None;
+        self.last_keyframe_idx = None;
+        self.velocity = None;
+        self.lost_since_sec = None;
+        self.imu_initialized = false;
+        self.imu_init_timestamp_sec = None;
+        self.velocity_world = Vec3F64::ZERO;
+    }
+
+    /// Resumes tracking from an applied inertial initialization: kornia-slam's
+    /// `SystemState::adopt_inertial_initialization` for the `Some` case. The caller handles the
+    /// `None` case, where kornia-slam would still mark the state initialized.
+    fn adopt_inertial_initialization(&mut self, aligned: AlignedTrackingState) {
+        self.velocity_world = aligned.velocity_world;
+        self.pose_world_to_cam = aligned.pose_world_to_cam;
+        self.velocity = None;
+        self.imu_initialized = true;
+    }
+}
+
 /// The tracker's inertial half: the sample ring, the initializer, and the estimates
 /// `kornia_slam`'s inertial APIs keep OUTSIDE the map.
 ///
 /// `Map` stores per-keyframe velocity and bias, but the *current* linearization bias, the
-/// gravity direction and the staged initialization's progress live nowhere in the library — the pipeline
-/// owns them, and this tracker does not use the pipeline. This struct is that ownership.
+/// gravity direction and the staged initialization's progress live nowhere in the library —
+/// `SlamSystem` owns them privately, and this tracker does not use `SlamSystem`. This struct is
+/// that ownership.
 struct InertialState {
     cfg: InertialConfig,
     buffer: ImuBuffer,
     initializer: ImuInitializer,
     /// Linearization point for the NEXT edge. Refreshed from the newest keyframe after every
     /// local BA: leaving it at the bootstrap value makes every edge linearize at a stale bias,
-    /// which drives `Map`'s 0.02 repropagation threshold to fire on every factor, every solve.
+    /// which drives the inertial BA's 0.02 repropagation threshold to fire on every factor, every
+    /// solve.
     bias: ImuBias,
     /// Gravity in the world frame. `(0, 0, -9.81)` until `apply_initialization` gravity-aligns
     /// the map, after which it is `(0, +9.81, 0)` — OpenCV Y-down, matching
@@ -435,7 +540,7 @@ impl InertialState {
             buffer: ImuBuffer::with_capacity(cfg.buffer_capacity),
             initializer: ImuInitializer::new(cfg.init.clone()),
             bias: cfg.initial_bias,
-            // Mirrors the pipeline's pre-initialization value. It is never read before
+            // Mirrors `SlamSystem`'s pre-initialization value. It is never read before
             // `apply_initialization` overwrites it, but a zero vector here would be a silent
             // "no gravity" if that invariant ever slipped.
             gravity_world: Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE),
@@ -485,10 +590,10 @@ impl InertialState {
 /// time throttle is exactly what would drop it. Otherwise once per `retry_sec`. Split out so the
 /// throttle is testable without a map behind it.
 ///
-/// Two callers. `log_init_window` passes `ready`, where the transition out of "never ready" is the
-/// only line anyone waits for. The tracking-loss line passes `map_established`, where losing an
-/// ESTABLISHED map and failing to bootstrap one are different faults a time throttle would blend
-/// into one stream.
+/// Three callers. `log_init_window` passes `ready`, where the transition out of "never ready" is
+/// the only line anyone waits for. The tracking-loss line passes `map_established`, where losing
+/// an ESTABLISHED map and failing to bootstrap one are different faults a time throttle would
+/// blend into one stream. The BA-refusal line passes a constant, so it is a plain time throttle.
 fn should_log_throttled(
     last: Option<(f64, bool)>,
     now_sec: f64,
@@ -568,6 +673,21 @@ pub struct Tracker {
     gyro_prior_unavailable: u64,
     /// Set when an insertion took the map past `max_keyframes`; acted on next frame.
     pending_map_reset: bool,
+    /// Set when a loss re-bootstrap into the KEPT map could not anchor on the loss frame itself.
+    /// The next frame that does anchor is then the same dead-reckoned coast, so it is reported
+    /// `Skipped` as the immediate re-bootstrap is. Cleared by every map drop: a fresh world at
+    /// identity is a measurement.
+    coast_rebootstrap_pending: bool,
+    /// Map writes (keyframe or landmark insertions, observation links) kornia-slam refused, over
+    /// the tracker's lifetime — a map drop does not zero it. Each is logged where it happened. A
+    /// refusal leaves nothing behind but a thinner map, so this count is the only trace of one.
+    map_writes_refused: u64,
+    /// Local BA results `Map::apply_ba_update` refused, over the tracker's lifetime. A refusal
+    /// leaves the map as it was before the solve, which looks exactly like a BA that ran.
+    ba_updates_refused: u64,
+    /// When the BA-refusal line last spoke; see [`should_log_throttled`]. The lifetime count
+    /// it prints carries the volume the throttle drops.
+    last_ba_refusal_log: Option<(f64, bool)>,
     /// Monotonic count of frames received; stamped onto `Frame::idx`.
     next_frame_idx: usize,
     /// First timestamp seen; all internal times are seconds relative to it, so
@@ -658,6 +778,10 @@ impl Tracker {
             last_frame_stamp_ns: None,
             gyro_prior_unavailable: 0,
             pending_map_reset: false,
+            coast_rebootstrap_pending: false,
+            map_writes_refused: 0,
+            ba_updates_refused: 0,
+            last_ba_refusal_log: None,
             next_frame_idx: 0,
             epoch_ns: None,
             last_keyframe_timestamp_sec: None,
@@ -683,7 +807,8 @@ impl Tracker {
     /// The frame on which a tracking loss re-bootstraps is `Untracked` too, even
     /// though it *does* create a keyframe: the new map is anchored at the
     /// dead-reckoned pose, so publishing it would be publishing a coast as a
-    /// measurement.
+    /// measurement. That holds when the re-bootstrap lands on a later frame
+    /// because the loss frame itself was unusable.
     ///
     /// `stamp` is the pair's capture time, on the same clock as the IMU samples. It drives the
     /// tracking-loss grace period and the inertial windows, and is returned unmodified on
@@ -739,7 +864,7 @@ impl Tracker {
         let frame = Frame {
             idx: 0, // replaced by `process_frame`
             features,
-            pose_world_to_cam: Pose3d::IDENTITY, // replaced by the pipeline
+            pose_world_to_cam: Pose3d::IDENTITY, // replaced by `process_frame`
             image_size,
             keypoint_colors,
             u_right: stereo.u_right,
@@ -798,19 +923,26 @@ impl Tracker {
         self.stats.stereo_matches = frame.depth.iter().filter(|&&d| d > 0.0).count();
         self.stats.inliers = 0;
 
+        // No `ImuInit` arm: see [`SystemMode`] for why this tracker never parks there.
+        let frame_idx = frame.idx;
         let status = match self.state.mode {
-            SystemMode::Bootstrap => self.bootstrap_stereo(frame, ts_sec, stamp_ns),
-            SystemMode::Tracking => self.tracking_step(frame, ts_sec, stamp_ns),
-            SystemMode::ImuInit => {
-                // Unreachable in BOTH configurations, and deliberately so. `SlamPipeline` parks
-                // in `ImuInit` and stops tracking until initialization succeeds; this tracker
-                // keeps tracking visually throughout and runs the initializer as a side effect
-                // of keyframe insertion, so the mode is never entered even with the inertial
-                // path on. Recover rather than panic on a live stream.
-                error!("cu-kornia-vio reached SystemMode::ImuInit, which neither path ever sets");
-                self.state.mode = SystemMode::Bootstrap;
-                self.bootstrap_stereo(frame, ts_sec, stamp_ns)
+            SystemMode::Bootstrap => {
+                let status = self.bootstrap_stereo(frame, ts_sec, stamp_ns);
+                if status == TrackingStatus::KeyframeAccepted
+                    && std::mem::take(&mut self.coast_rebootstrap_pending)
+                {
+                    // The deferred half of the loss path's re-bootstrap; see the field.
+                    warning!(
+                        "re-bootstrapped at the extrapolated pose on frame {}; reporting Skipped \
+                         because that pose is dead-reckoned, not measured",
+                        frame_idx
+                    );
+                    TrackingStatus::Skipped
+                } else {
+                    status
+                }
             }
+            SystemMode::Tracking => self.tracking_step(frame, ts_sec, stamp_ns),
         };
 
         // EVERY path, not just `tracking_step`: a frame handled by `bootstrap_stereo` that left
@@ -957,6 +1089,16 @@ impl Tracker {
         self.gyro_prior_unavailable
     }
 
+    /// Map writes kornia-slam refused, over the tracker's lifetime. See the field.
+    pub fn map_writes_refused(&self) -> u64 {
+        self.map_writes_refused
+    }
+
+    /// Local BA results kornia-slam refused, over the tracker's lifetime. See the field.
+    pub fn ba_updates_refused(&self) -> u64 {
+        self.ba_updates_refused
+    }
+
     /// The tracker's current world-to-camera pose, measured or extrapolated.
     ///
     /// After a frame that returned [`TrackStatus::Untracked`] this is the constant-velocity
@@ -1086,7 +1228,8 @@ impl Tracker {
     /// Drops the map and all state, returning to bootstrap at identity.
     ///
     /// Note this is *stronger* than what a tracking loss does by default: there a loss
-    /// calls `SystemState::reset` and re-bootstraps into the **same** map at the preserved
+    /// resets the tracker state (`SystemState::reset`) and re-bootstraps into the **same** map
+    /// at the preserved
     /// pose, so keyframes and old map points accumulate — unless
     /// [`TrackerConfig::reset_map_on_loss`] routes losses here too. This is the only way to
     /// actually bound memory.
@@ -1123,6 +1266,7 @@ impl Tracker {
         // bound was armed would drop the fresh map on the next frame and bump the generation
         // a SECOND time, for no reason a consumer could see.
         self.pending_map_reset = false;
+        self.coast_rebootstrap_pending = false;
         self.last_frame_stamp_ns = None;
         self.world_generation += 1;
         // `next_frame_idx` and `epoch_ns` deliberately keep counting: frame
@@ -1160,33 +1304,35 @@ impl Tracker {
 
         // Captured before `from_frame` consumes the frame.
         let pose_inv = curr_frame.pose_world_to_cam.inverse();
-        let mut keyframe = Keyframe::from_frame(curr_frame);
-        let curr_idx = keyframe.frame.idx;
+        let curr_idx = curr_frame.idx;
+        let seeds: Vec<LandmarkSeed> = cam_points
+            .iter()
+            .map(|(desc_idx, p_cam)| LandmarkSeed {
+                position: pose_inv.transform_point(p_cam),
+                color: keypoint_color(&curr_frame, *desc_idx),
+                reference: ObservationKey {
+                    keyframe_idx: curr_idx,
+                    feature_idx: *desc_idx,
+                },
+            })
+            .collect();
 
-        let mut points: Vec<TriangulatedPoint> = Vec::with_capacity(cam_points.len());
-        for (desc_idx, p_cam) in &cam_points {
-            let p_world = pose_inv.transform_point(p_cam);
-            let descriptor = keyframe.frame.features.descriptors[*desc_idx];
-            let color = keypoint_color(&keyframe.frame, *desc_idx);
-            points.push((p_world, descriptor, color, *desc_idx, *desc_idx));
+        // The keyframe enters the map FIRST: kornia-slam links a landmark only to a keyframe the
+        // map holds, and derives the landmark's scale geometry from it on the spot.
+        if let Err(e) = self.map.insert_keyframe(self.seeded_keyframe(curr_frame)) {
+            self.map_writes_refused += 1;
+            error!(
+                "bootstrap_stereo: the map refused the bootstrap keyframe, frame dropped: frame={} error={}",
+                curr_idx,
+                e.to_string()
+            );
+            return TrackingStatus::Skipped;
         }
-
-        // `prev_kf = None`: only `curr_kf` gets associations and observations.
-        // The return value is `points.len()` unconditionally — an attempt count,
-        // never a success signal.
-        let first_new_mp_idx = self.map.num_map_points();
-        let attempted = self
-            .map
-            .add_triangulated_points(None, &mut keyframe, &points);
-        self.map.upsert_keyframe(keyframe);
-        // See `refresh_new_map_point_geometry`: the geometry pass inside
-        // `add_triangulated_points` ran while `keyframe` was still local, so it
-        // was a no-op and every point above still has `max_distance = 0`.
-        self.refresh_new_map_point_geometry(first_new_mp_idx);
+        let inserted = self.insert_landmarks(seeds, "bootstrap");
 
         info!(
             "bootstrap_stereo: metric map created from one stereo frame: frame={} points={}",
-            curr_idx, attempted
+            curr_idx, inserted
         );
 
         self.state.current_keyframe_idx = Some(curr_idx);
@@ -1198,6 +1344,25 @@ impl Tracker {
         self.arm_inertial_window(curr_idx, timestamp_sec, stamp_ns);
 
         TrackingStatus::KeyframeAccepted
+    }
+
+    /// A keyframe for `frame`, seeded with the current IMU bias and, once initialized, the
+    /// current velocity — as kornia-slam's `SlamSystem` seeds its own.
+    ///
+    /// `Keyframe::from_frame` zeroes both, and the sync-back after each insertion copies the
+    /// newest keyframe's bias into the NEXT edge's linearization point. Unseeded, a keyframe no
+    /// alignment or VI-BA wrote would zero that point: the bias a map drop kept, or
+    /// `InertialConfig::initial_bias`, lost at the first keyframe. Seeded, VI-BA also starts the
+    /// newest keyframe from the current estimate rather than from rest.
+    fn seeded_keyframe(&self, frame: Frame) -> Keyframe {
+        let mut kf = Keyframe::from_frame(frame);
+        if let Some(inert) = &self.inertial {
+            kf.imu_bias = inert.bias;
+            if self.state.imu_initialized {
+                kf.velocity_world = self.state.velocity_world;
+            }
+        }
+        kf
     }
 
     /// Anchors the inertial initialization window on the keyframe the map was just built from.
@@ -1396,8 +1561,8 @@ impl Tracker {
                 // inlier set — `solve_pnp` returns `(Pose3d, usize)` and throws
                 // the mask away. Everything downstream of here writes those
                 // correspondences into the map permanently (keyframe
-                // associations, `register_observation`, and the `n_found`
-                // counter that `cull()` keys off), and `run_local_ba` uses
+                // associations, the landmarks' observation records, and the
+                // `n_found` counter that `cull_landmarks` keys off), and `run_local_ba` uses
                 // `BaParams::default()`, whose kernel is `Identity` with
                 // `robust_scale_sq = INFINITY` — plain L2, no Huber. So a
                 // correspondence that PnP itself rejected would enter BA at
@@ -1449,8 +1614,9 @@ impl Tracker {
             );
             // Evaluated at `candidate_pose`, NOT at the estimated pose: visibility
             // is counted before refinement, matching the ORB-SLAM3 reference
-            // implementation. It biases `n_visible`, hence `cull()`'s found_ratio.
-            let visible = self.map.map_points_in_frustum(
+            // implementation. It biases `n_visible`, hence `cull_landmarks`'s found_ratio.
+            let visible = landmarks_in_frustum(
+                &self.map,
                 &local_indices,
                 &self.camera,
                 &candidate_pose,
@@ -1592,6 +1758,10 @@ impl Tracker {
                     self.world_generation += 1;
                 }
                 let recovered = self.bootstrap_stereo(frame, timestamp_sec, stamp_ns);
+                // An unusable loss frame defers the re-anchor to the next usable one, which is
+                // the same coast. A dropped map needs no flag: its fresh world starts at identity.
+                self.coast_rebootstrap_pending =
+                    !self.config.reset_map_on_loss && recovered != TrackingStatus::KeyframeAccepted;
                 // The pose the new map was just anchored at is `candidate_pose`
                 // — pure constant-velocity extrapolation over every frame since
                 // tracking failed, which at 30 fps and a 0.5 s grace is up to
@@ -1601,8 +1771,9 @@ impl Tracker {
                 // task publishes and which also resets
                 // `consecutive_failures` to 0 — a fabricated pose, published as
                 // measured, with every health field reading green. Report
-                // `Skipped` regardless of whether the map was rebuilt; the next
-                // frame that actually tracks against the new map is the first
+                // `Skipped` regardless of whether the map was rebuilt (or, via
+                // `coast_rebootstrap_pending`, on the later frame that rebuilds it);
+                // the next frame that actually tracks against it is the first
                 // measured pose again.
                 if recovered == TrackingStatus::KeyframeAccepted {
                     warning!(
@@ -1612,8 +1783,9 @@ impl Tracker {
                     );
                 }
                 // Early return, so `last_frame_timestamp_sec` is not updated on
-                // this frame — harmless for stereo (only the IMU window reads
-                // it), but do not "fix" it silently if IMU is ever added.
+                // this frame — harmless, nothing here reads it (kornia-slam's own
+                // state bounds a per-frame IMU window with it), but do not "fix"
+                // it silently if a reader is ever added.
                 return TrackingStatus::Skipped;
             }
         } else {
@@ -1662,8 +1834,8 @@ impl Tracker {
             .collect()
     }
 
-    /// Canonical order: associate -> densify close stereo -> grow(xN) -> upsert
-    /// -> fuse -> local BA -> pose sync-back -> cull.
+    /// Canonical order: insert -> associate -> densify close stereo -> grow(xN)
+    /// -> IMU edge -> fuse -> local BA -> pose sync-back -> cull.
     fn try_insert_keyframe(
         &mut self,
         frame: &Frame,
@@ -1705,7 +1877,7 @@ impl Tracker {
             return false;
         }
 
-        let mut curr_kf = Keyframe::from_frame(Frame {
+        let curr_kf = self.seeded_keyframe(Frame {
             idx: frame.idx,
             features: frame.features.clone(),
             pose_world_to_cam: self.state.pose_world_to_cam,
@@ -1718,33 +1890,8 @@ impl Tracker {
             keypoints_undist: frame.keypoints_undist.clone(),
         });
 
-        for &(mp_idx, curr_idx) in matches {
-            curr_kf.associate_map_point(curr_idx, mp_idx);
-            self.map.register_observation(mp_idx, &curr_kf, curr_idx);
-        }
-
-        // Every map point created below is created while `curr_kf` is still a
-        // local value, so `update_map_point_geometry`'s `get_keyframe(ref_kf_idx)`
-        // lookup inside `add_triangulated_points` misses and returns early —
-        // see the `refresh_new_map_point_geometry` call after `upsert_keyframe`.
-        let first_new_mp_idx = self.map.num_map_points();
-
-        // Stereo densification. Must run after association (so the
-        // "already tracked" filter is meaningful) and before grow (so grow's
-        // "unassociated only" filter sees these as taken).
-        if let Some(close_depth_threshold) =
-            self.config.stereo_close_depth.map(|d| d.get::<meter>())
-            && curr_kf.frame.is_stereo()
-        {
-            let n_close = self.add_close_stereo_points(&mut curr_kf, close_depth_threshold);
-            debug!(
-                "keyframe: stereo densification frame={} close_points={}",
-                frame.idx, n_close
-            );
-        }
-
-        // Recency as a covisibility proxy, newest first. `curr_kf` is not in the
-        // map yet, so it cannot appear here.
+        // Recency as a covisibility proxy, newest first. Taken BEFORE the insertion below, so
+        // `curr_kf` itself is not among them.
         let neighbor_kf_indices: Vec<usize> = self
             .map
             .keyframes()
@@ -1754,6 +1901,72 @@ impl Tracker {
             .map(|kf| kf.frame.idx)
             .collect();
 
+        // The keyframe enters the map FIRST, with no associations: kornia-slam links a feature
+        // to a landmark only on a keyframe the map already holds, and every link below
+        // (tracked matches, stereo densification, growth, fuse) goes through the map so both
+        // sides of the association stay in step. Nothing between here and the old insertion
+        // point read the keyframe list, so the neighbour set and every pass see what they did.
+        if let Err(e) = self.map.insert_keyframe(curr_kf) {
+            self.map_writes_refused += 1;
+            error!(
+                "keyframe: the map refused the keyframe, not inserted: frame={} error={}",
+                frame.idx,
+                e.to_string()
+            );
+            return false;
+        }
+
+        // One landmark per feature and one feature per landmark, first claim wins — upstream's
+        // `keyframe_insertion` resolves tracked links the same way. Duplicates are reachable:
+        // `estimate_pose`'s reference-keyframe fallback matches one-directionally, so two
+        // landmarks can claim one feature, and `reject_pnp_outliers` keeps both. Dropped here,
+        // they never reach the map as a refusal.
+        let claims = accepted_pair_claims(matches);
+        if claims.len() < matches.len() {
+            debug!(
+                "keyframe: duplicate tracked claims dropped: frame={} dropped={} matches={}",
+                frame.idx,
+                matches.len() - claims.len(),
+                matches.len()
+            );
+        }
+        let mut link_refused = 0u64;
+        for (mp_idx, curr_idx) in claims.into_iter().map(|i| matches[i]) {
+            if let Err(e) = self.map.link_observation(frame.idx, curr_idx, mp_idx) {
+                link_refused += 1;
+                debug!(
+                    "keyframe: tracked match not linked: frame={} feature={} map_point={} error={}",
+                    frame.idx,
+                    curr_idx,
+                    mp_idx,
+                    e.to_string()
+                );
+            }
+        }
+        if link_refused > 0 {
+            self.map_writes_refused += link_refused;
+            warning!(
+                "keyframe: the map refused tracked-match links: frame={} refused={} matches={}",
+                frame.idx,
+                link_refused,
+                matches.len()
+            );
+        }
+
+        // Stereo densification. Must run after association (so the
+        // "already tracked" filter is meaningful) and before grow (so grow's
+        // "unassociated only" filter sees these as taken).
+        if let Some(close_depth_threshold) =
+            self.config.stereo_close_depth.map(|d| d.get::<meter>())
+            && frame.is_stereo()
+        {
+            let n_close = self.add_close_stereo_points(frame.idx, close_depth_threshold);
+            debug!(
+                "keyframe: stereo densification frame={} close_points={}",
+                frame.idx, n_close
+            );
+        }
+
         let match_config = self.config.two_view_init.match_config;
         let triangulation_config = self.config.two_view_init.triangulation_config.clone();
 
@@ -1761,29 +1974,22 @@ impl Tracker {
         for &nb_kf_idx in &neighbor_kf_indices {
             total_grown += self.grow_map_points_from_keyframe_pair(
                 nb_kf_idx,
-                &mut curr_kf,
+                frame.idx,
                 match_config,
                 &triangulation_config,
             );
         }
 
-        // The keyframe enters the map only here.
-        self.map.upsert_keyframe(curr_kf);
         self.last_keyframe_timestamp_sec = Some(timestamp_sec);
         self.last_keyframe_stamp_ns = Some(stamp_ns);
         self.state.current_keyframe_idx = Some(frame.idx);
         self.state.last_keyframe_idx = Some(frame.idx);
 
-        // Inertial edge + initialization ladder. Placed here, immediately after the upsert and
-        // before fuse, to match `SlamPipeline`'s factor ordering: both endpoints of the edge
-        // are now in the map, which is the invariant `run_local_inertial_ba` and
-        // `ImuInitializer` both silently `continue` past when it does not hold. `None` — the
-        // configuration this repo ships — means every line below behaves exactly as before.
+        // Inertial edge + initialization ladder: after growth, before fuse, where it has always
+        // been. Both endpoints of the edge are in the map, which `Map::apply_insertion` refuses
+        // an IMU factor without and `ImuInitializer` silently skips a factor without. `None` —
+        // the configuration this repo ships — means every line below behaves exactly as before.
         let inertial_ba = self.on_keyframe_inertial(prev_edge, frame.idx, stamp_ns);
-
-        // Now that the reference keyframe is reachable, give the new points the
-        // scale geometry they could not get at creation time.
-        self.refresh_new_map_point_geometry(first_new_mp_idx);
 
         // Fuse before local BA, deliberately: BA then sees the extra
         // reprojection constraints.
@@ -1805,25 +2011,48 @@ impl Tracker {
         let ran_ba =
             self.config.enable_local_ba && self.map.keyframes().len() > BA_ACTIVE_KEYFRAMES;
         if ran_ba {
-            match inertial_ba {
+            // kornia-slam's only BA entry points solve a `BaSnapshot` and hand back an update
+            // for `apply_ba_update` to validate and write. The solve is the one the removed
+            // live-map methods ran, but the path costs more: the snapshot deep-clones every
+            // keyframe, map point and IMU factor (raw samples included, ~53 MB after an hour
+            // of an unbounded inertial map) once per keyframe, and the write-back matches IMU
+            // factors in O(F^2). `max_keyframes` bounds both.
+            let snapshot = self.map.ba_snapshot();
+            let update = match inertial_ba {
                 // 15 DOF per keyframe (pose, velocity, bias) instead of 6. Mirrors
-                // kornia-slam's `local_mapping::solve_snapshot`, which branches on exactly this
-                // flag.
-                // Called on the LIVE map rather than through `Map::local_ba_snapshot()`:
-                // that path deep-clones the map INCLUDING every factor's retained raw
-                // samples once per keyframe (~53 MB and ~6k allocations after an hour) and
-                // merges factors back in O(F^2). It exists to move the solve off-thread,
-                // and this BA is already synchronous.
+                // kornia-slam's own local mapping, which branches on exactly this flag.
                 Some((imu_t_bc, gravity_world)) => {
-                    self.map
-                        .run_local_inertial_ba(&self.camera, Some(imu_t_bc), gravity_world);
+                    run_local_inertial_ba(snapshot, &self.camera, Some(imu_t_bc), gravity_world)
                 }
-                None => self.map.run_local_ba(&self.camera),
+                None => run_local_ba(snapshot, &self.camera),
+            };
+            // Refused wholesale (a non-finite estimate or IMU factor, or a world frame that moved
+            // since the snapshot, which cannot happen on this synchronous path): the map keeps
+            // its pre-BA state, exactly what a solver failure has always left. Counted, because
+            // that state is indistinguishable from a BA that ran; throttled, because a cause
+            // that persists refuses every keyframe's BA until the map drops.
+            if let Err(e) = self.map.apply_ba_update(update) {
+                self.ba_updates_refused += 1;
+                if should_log_throttled(
+                    self.last_ba_refusal_log,
+                    timestamp_sec,
+                    true,
+                    LOSS_LOG_RETRY_SEC,
+                ) {
+                    self.last_ba_refusal_log = Some((timestamp_sec, true));
+                    warning!(
+                        "keyframe: local BA result refused, map left as it was: frame={} \
+                         refused_total={} error={}",
+                        frame.idx,
+                        self.ba_updates_refused,
+                        e.to_string()
+                    );
+                }
             }
         }
 
-        // The keyframe just upserted is the newest: `Frame::idx` only grows and `upsert_keyframe`
-        // appends a new index. O(1) here, where `Map::get_keyframe(frame.idx)` is a linear scan
+        // The keyframe just inserted is the newest: `Frame::idx` only grows and `insert_keyframe`
+        // appends. O(1) here, where `Map::get_keyframe(frame.idx)` is a linear scan
         // over every keyframe since the last reset.
         if let Some(newest_kf) = self.map.keyframes().last() {
             debug_assert_eq!(newest_kf.frame.idx, frame.idx);
@@ -1834,17 +2063,18 @@ impl Tracker {
             // After BA, not before: the inertial solve writes velocity and bias onto the last
             // three keyframes, and the NEXT edge must be linearized at that refreshed bias.
             // Without this the next edge is linearized at the bootstrap bias forever, which
-            // drives `Map`'s 0.02 repropagation threshold to fire on every factor of every solve
-            // — a purely numerical cost that also makes the first-order bias correction the
-            // dominant residual, which the optimizer cannot tell apart from signal. Runs on the
-            // early (pre-BA) keyframes too, where it is a copy of what the edge already used.
+            // drives the inertial BA's 0.02 repropagation threshold to fire on every factor of
+            // every solve — a purely numerical cost that also makes the first-order bias
+            // correction the dominant residual, which the optimizer cannot tell apart from
+            // signal. Where no alignment or VI-BA wrote the keyframe, this reads back what
+            // `seeded_keyframe` put on it.
             if let Some(inert) = self.inertial.as_mut() {
                 inert.bias = newest_kf.imu_bias;
                 self.state.velocity_world = newest_kf.velocity_world;
             }
         }
 
-        self.map.cull();
+        cull_landmarks(&mut self.map);
 
         debug!(
             "keyframe inserted: frame={} grown={} fused={} neighbors={} map_points={} keyframes={}",
@@ -1860,8 +2090,8 @@ impl Tracker {
 
     // ── Inertial ─────────────────────────────────────────────────────────────
 
-    /// Everything the inertial path does on a keyframe insertion, in the order
-    /// `SlamPipeline` does it: build the edge, prune, then run the initialization ladder.
+    /// Everything the inertial path does on a keyframe insertion, in the order kornia-slam's
+    /// removed `SlamPipeline` did it: build the edge, prune, then run the initialization ladder.
     ///
     /// Returns `Some((imu_t_bc, gravity_world))` when local BA should take the inertial path,
     /// and `None` — including for every call with the inertial path off — when it should not.
@@ -1873,10 +2103,10 @@ impl Tracker {
     /// `try_initialize` and counts the result, but never applies it: see
     /// [`Self::accept_inertial_init`].
     ///
-    /// The state is `take`n for the duration because the initializer wants `&Map` and
-    /// `&mut SystemState` at the same time, which it cannot have while a field of `self` is
-    /// borrowed. The move is a handful of scalars plus the ring's `VecDeque` handle; nothing is
-    /// copied.
+    /// The state is `take`n for the duration because the initializer wants `&mut Map` and
+    /// `&mut` the inertial bias and gravity at the same time, which it cannot have while a
+    /// field of `self` is borrowed. The move is a handful of scalars plus the ring's `VecDeque`
+    /// handle; nothing is copied.
     fn on_keyframe_inertial(
         &mut self,
         prev_edge: Option<(usize, u64)>,
@@ -1928,7 +2158,7 @@ impl Tracker {
         stamp_ns: u64,
         epoch: u64,
     ) {
-        // Converted once, straight out of the ring, into the one owned copy `add_imu_factor`
+        // Converted once, straight out of the ring, into the one owned copy the `ImuFactor`
         // keeps. Seconds relative to the tracker's frame epoch — the SAME conversion
         // `process_frame` applies to frame stamps. `from_measurements` filters the samples by
         // `[t0, t1]`, so a second epoch here would drop every one of them and return the
@@ -1970,9 +2200,10 @@ impl Tracker {
         let non_positive_dt = !(preint.dt > 0.0);
         if non_positive_dt {
             // Should be unreachable behind the gates above. Checked anyway because
-            // `add_imu_factor` is a bare `push` with no validation and `vi_ba_schur` answers a
-            // singular covariance with a 1e6-diagonal information matrix and a printed warning
-            // — a hugely-weighted zero-motion constraint, not an error.
+            // `Map::apply_insertion` validates the factor's `[t0, t1]` interval but not the
+            // integrated `dt`, and `vi_ba_schur` answers a singular covariance with a
+            // 1e6-diagonal information matrix and a printed warning — a hugely-weighted
+            // zero-motion constraint, not an error.
             inert.stats.refused_zero_dt += 1;
             warning!(
                 "inertial: preintegration returned dt = 0 despite passing coverage; edge dropped: \
@@ -1983,17 +2214,51 @@ impl Tracker {
             );
             return;
         }
+        // Behind the ingest gate (`ImuBufferStats::non_finite`) this should be unreachable too.
+        // Checked because the map admits a non-finite factor and `Map::apply_ba_update` then
+        // refuses every later BA write-back, visual included, until the map drops.
+        if !preintegration_is_finite(&preint) {
+            inert.stats.refused_non_finite += 1;
+            warning!(
+                "inertial: preintegration is not finite despite passing coverage; edge dropped: \
+                 prev_kf={} kf={} samples={}",
+                prev_kf_idx,
+                curr_kf_idx,
+                raw.len()
+            );
+            return;
+        }
 
         // Both indices are `Frame::idx`, NOT positions in `Map::keyframes` — `ImuFactor` is
-        // keyed by frame index everywhere it is read. An index naming no keyframe is not an
-        // error anywhere downstream; the factor simply vanishes from the problem.
+        // keyed by frame index everywhere it is read. `apply_insertion` refuses an endpoint
+        // the map does not hold, a self-edge, a duplicate edge and a non-increasing interval.
         //
         // `raw` is handed over as well, and kept for the life of the factor: it is what
-        // `Map`'s repropagation path re-integrates once the bias has drifted past 0.02 from
-        // this edge's linearization point. Passing an empty Vec compiles and leaves the edge
-        // permanently stuck at a stale linearization.
-        self.map
-            .add_imu_factor(prev_kf_idx, curr_kf_idx, preint, raw, t0, t1);
+        // the inertial BA's repropagation re-integrates once the bias has drifted past 0.02
+        // from this edge's linearization point. Passing an empty Vec compiles and leaves the
+        // edge permanently stuck at a stale linearization.
+        let factor = ImuFactor {
+            prev_kf_idx,
+            curr_kf_idx,
+            preintegrated: preint,
+            raw_samples: raw,
+            t0,
+            t1,
+        };
+        if let Err(e) = self.map.apply_insertion(MapInsertion {
+            imu_factors: vec![factor],
+            ..MapInsertion::default()
+        }) {
+            inert.stats.refused_by_map += 1;
+            warning!(
+                "inertial: the map refused the IMU edge; this keyframe pair stays visual-only: \
+                 prev_kf={} kf={} error={}",
+                prev_kf_idx,
+                curr_kf_idx,
+                e.to_string()
+            );
+            return;
+        }
         inert.stats.factors_added += 1;
     }
 
@@ -2079,7 +2344,7 @@ impl Tracker {
         };
         let init_elapsed = now_sec - window_start;
         // Past 50 s the window is far too large for a single joint solve to be worth attempting;
-        // this mirrors the pipeline's own ceiling.
+        // this mirrors the removed `SlamPipeline`'s own ceiling.
         if init_elapsed >= 50.0 {
             return;
         }
@@ -2107,13 +2372,26 @@ impl Tracker {
             1e5,
             true,
         );
+        self.finish_refinement(inert, result, start_idx, now_sec, stage);
+    }
+
+    /// Applies a refinement's outcome and marks the stage done WHATEVER it was — rejected by the
+    /// solve, or accepted and then refused by the map. The stage is scheduled once, as in the
+    /// ORB-SLAM3 reference implementation, and a failed refinement that retried every keyframe
+    /// would be the unthrottled solve the initial-solve path is careful to avoid. A failure
+    /// leaves the tracker on the previous initialization.
+    fn finish_refinement(
+        &mut self,
+        inert: &mut InertialState,
+        result: Option<ImuInitResult>,
+        start_idx: usize,
+        now_sec: f64,
+        stage: InitStage,
+    ) {
         match result {
             Some(init) => self.accept_inertial_init(inert, init, start_idx, now_sec, stage),
             None => info!("inertial: refinement rejected: stage={}", stage.as_str()),
         }
-        // Marked done either way: the stage is scheduled once, as in the ORB-SLAM3 reference implementation, and
-        // a rejected refinement that retried every keyframe would be the unthrottled solve the
-        // initial-solve path is careful to avoid.
         if stage == InitStage::Refine1 {
             inert.stats.first_refinement_done = true;
         } else {
@@ -2193,7 +2471,7 @@ impl Tracker {
     /// `enable_inertial_ba` off means the result is counted and logged but NOT applied. This is
     /// the whole content of the flag's "cannot move a published pose" promise, and it is not
     /// redundant with the local-BA selection in `on_keyframe_inertial`: `apply_initialization`
-    /// calls `Map::scale_world` and `Map::rotate_world` on every keyframe and map point, then
+    /// scales and rotates every keyframe and map point (`Map::apply_inertial_alignment`), then
     /// the world generation goes up, which `task.rs` publishes as `VioStatus::reset_epoch` and
     /// which every consumer answers by wiping its trail and re-deriving its anchor. Without this
     /// gate, a yaw-unverified extrinsic with the flag off would produce that wipe at the initial
@@ -2246,16 +2524,59 @@ impl Tracker {
         stage: InitStage,
     ) {
         let (scale, gravity, bias) = (init.scale, init.gravity_world, init.bias);
-        inert.initializer.apply_initialization(
+        let applied = inert.initializer.apply_initialization(
             &mut self.map,
-            &mut self.state,
             &mut inert.bias,
             &mut inert.gravity_world,
             init,
             start_idx,
         );
-        // `apply_initialization` calls `Map::scale_world` then `Map::rotate_world`: every
-        // keyframe pose and every map point moves, so that gravity lands on world +y. Poses
+        match applied {
+            Ok(Some(aligned)) => self.state.adopt_inertial_initialization(aligned),
+            // `apply_inertial_alignment` refuses an empty velocity list, and a non-empty one
+            // names a window keyframe, so `Ok` with no keyframe to resume from should be
+            // unreachable. If it happens the map HAS been scaled and rotated (and the bias and
+            // gravity taken), so the generation must still move — but with no aligned pose or
+            // velocity to resume from, the tracker does not claim to be initialized.
+            // kornia-slam's own `adopt_inertial_initialization(None)` would mark it initialized
+            // anyway; a tracker that switched to inertial BA without a velocity is worse than
+            // one that retries.
+            Ok(None) => {
+                self.world_generation += 1;
+                inert.stats.init_apply_refused += 1;
+                error!(
+                    "inertial: initialization moved the map but named no keyframe to resume \
+                     from; staying visual-only: stage={} start_kf={} world_generation={}",
+                    stage.as_str(),
+                    start_idx,
+                    self.world_generation
+                );
+                return;
+            }
+            // Refused before any write: map, bias and gravity are as they were, so nothing
+            // moved and the generation stays. A refused initial solve leaves the tracker
+            // visual-only until the next accepted one (`init_retry`); a refused refinement leaves
+            // it on the previous initialization, and the stage is not retried.
+            Err(e) => {
+                inert.stats.init_apply_refused += 1;
+                let outcome = if self.state.imu_initialized {
+                    "staying on the previous initialization, stage not retried"
+                } else {
+                    "staying visual-only until the next accepted solve"
+                };
+                warning!(
+                    "inertial: the map refused the initialization, map left unchanged; {}: \
+                     stage={} scale={} error={}",
+                    outcome,
+                    stage.as_str(),
+                    scale,
+                    e.to_string()
+                );
+                return;
+            }
+        }
+        // `apply_initialization` scales and rotates the whole map (`Map::apply_inertial_alignment`):
+        // every keyframe pose and every map point moves, so that gravity lands on world +y. Poses
         // published before this instant and after it are in DIFFERENT frames, and the only
         // thing that says so on the wire is this counter — the same contract a requested reset
         // and a loss re-bootstrap already use. Consumers that map tracker poses into another
@@ -2278,72 +2599,95 @@ impl Tracker {
         );
     }
 
-    /// Recomputes the scale geometry of every map point from `first_idx` on.
+    /// Inserts each seed as a new landmark, returning how many the map accepted.
     ///
-    /// `Map::add_triangulated_points` already calls `update_map_point_geometry`
-    /// for each point it creates — but every one of our creation sites runs
-    /// while the reference keyframe is still a *local* `Keyframe`, not yet in
-    /// the map, so that call hits `let Some(ref_kf) = self.get_keyframe(..)
-    /// else { return; }` and does nothing. The points are then left with
-    /// `min_distance = max_distance = 0` and a zero mean viewing direction,
-    /// which makes `match_by_projection` skip its whole scale-invariance block
-    /// (`if mp.max_distance > 0.0`): the distance gate and the predicted-octave
-    /// window are silently off for exactly the freshly created points.
-    ///
-    /// `run_local_ba` would repair it, but only if it gets past all four of its
-    /// early returns — and not at all when `enable_local_ba` is false. So do it
-    /// here, unconditionally, as soon as the keyframe is reachable.
-    fn refresh_new_map_point_geometry(&mut self, first_idx: usize) {
-        for mp_idx in first_idx..self.map.num_map_points() {
-            self.map
-                .update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+    /// One at a time rather than as one `apply_insertion` batch: a batch is all-or-nothing, and
+    /// one refused seed must cost one point, not the whole keyframe's worth. Every seed here
+    /// references a free feature of a keyframe the map holds at a finite position, so a refusal
+    /// is an invariant break; each is counted in [`Tracker::map_writes_refused`] and the
+    /// total is logged. The map computes each new landmark's descriptor and scale geometry as it
+    /// links it, from the reference keyframe it now holds.
+    fn insert_landmarks(
+        &mut self,
+        seeds: impl IntoIterator<Item = LandmarkSeed>,
+        site: &'static str,
+    ) -> usize {
+        let (mut inserted, mut refused) = (0usize, 0u64);
+        for seed in seeds {
+            match self.map.insert_landmark(seed) {
+                Ok(_) => inserted += 1,
+                Err(e) => {
+                    refused += 1;
+                    debug!(
+                        "map refused a landmark: site={} kf={} feature={} error={}",
+                        site,
+                        seed.reference.keyframe_idx,
+                        seed.reference.feature_idx,
+                        e.to_string()
+                    );
+                }
+            }
         }
+        if refused > 0 {
+            self.map_writes_refused += refused;
+            warning!(
+                "map refused landmark insertions: site={} refused={} inserted={}",
+                site,
+                refused,
+                inserted
+            );
+        }
+        inserted
     }
 
-    /// Back-projects `curr_kf`'s unassociated *close* (`z <= close_depth_threshold`)
+    /// Back-projects keyframe `curr_kf_idx`'s unassociated *close* (`z <= close_depth_threshold`)
     /// stereo keypoints into new metric map points. Far points are left to multi-view
     /// triangulation in the growth pass.
-    fn add_close_stereo_points(
-        &mut self,
-        curr_kf: &mut Keyframe,
-        close_depth_threshold: f64,
-    ) -> usize {
-        let cam_points = unproject_stereo(&curr_kf.frame, &self.camera);
-        if cam_points.is_empty() {
-            return 0;
-        }
-        let pose_inv = curr_kf.frame.pose_world_to_cam.inverse();
-
-        let mut points: Vec<TriangulatedPoint> = Vec::new();
-        for (desc_idx, p_cam) in &cam_points {
-            if p_cam.z > close_depth_threshold {
-                continue;
+    fn add_close_stereo_points(&mut self, curr_kf_idx: usize, close_depth_threshold: f64) -> usize {
+        let seeds: Vec<LandmarkSeed> = {
+            let Some(curr_kf) = self.map.get_keyframe(curr_kf_idx) else {
+                return 0;
+            };
+            let cam_points = unproject_stereo(&curr_kf.frame, &self.camera);
+            if cam_points.is_empty() {
+                return 0;
             }
-            if curr_kf.map_point(*desc_idx).is_some() {
-                continue;
-            }
-            let p_world = pose_inv.transform_point(p_cam);
-            let descriptor = curr_kf.frame.features.descriptors[*desc_idx];
-            let color = keypoint_color(&curr_kf.frame, *desc_idx);
-            points.push((p_world, descriptor, color, *desc_idx, *desc_idx));
-        }
-
-        self.map.add_triangulated_points(None, curr_kf, &points)
+            let pose_inv = curr_kf.frame.pose_world_to_cam.inverse();
+            cam_points
+                .iter()
+                .filter(|(desc_idx, p_cam)| {
+                    p_cam.z <= close_depth_threshold && curr_kf.map_point(*desc_idx).is_none()
+                })
+                .map(|(desc_idx, p_cam)| LandmarkSeed {
+                    position: pose_inv.transform_point(p_cam),
+                    color: keypoint_color(&curr_kf.frame, *desc_idx),
+                    reference: ObservationKey {
+                        keyframe_idx: curr_kf_idx,
+                        feature_idx: *desc_idx,
+                    },
+                })
+                .collect()
+        };
+        self.insert_landmarks(seeds, "stereo_densification")
     }
 
     /// Triangulates new map points from the unassociated features shared by
-    /// `prev_kf_idx` and `curr_kf`, gated by the pose-derived epipolar geometry
+    /// `prev_kf_idx` and `curr_kf_idx`, gated by the pose-derived epipolar geometry
     /// (the triangulation search of Campos et al., ORB-SLAM3, IEEE T-RO 2021).
     fn grow_map_points_from_keyframe_pair(
         &mut self,
         prev_kf_idx: usize,
-        curr_kf: &mut Keyframe,
+        curr_kf_idx: usize,
         match_config: OrbMatchConfig,
         triangulation_config: &TriangulationConfig,
     ) -> usize {
-        // Read-only phase; the shared borrow of `self.map` ends with this block.
-        let points: Vec<TriangulatedPoint> = {
-            let Some(prev_kf) = self.map.get_keyframe(prev_kf_idx) else {
+        // Read-only phase; the shared borrow of `self.map` ends with this block. Each entry is
+        // `(position, color, prev_idx, curr_idx)`.
+        let points: Vec<(Vec3F64, [u8; 3], usize, usize)> = {
+            let (Some(prev_kf), Some(curr_kf)) = (
+                self.map.get_keyframe(prev_kf_idx),
+                self.map.get_keyframe(curr_kf_idx),
+            ) else {
                 return 0;
             };
 
@@ -2437,14 +2781,13 @@ impl Tracker {
             // they all lie on the shared epipolar line by construction, so the
             // chi-square gate below keeps every one of them. The `curr_kf
             // .map_point(curr_idx).is_some()` guard further down runs *before*
-            // `add_triangulated_points`, so it cannot see duplicates created in
-            // the same batch: two distinct 3D points at different depths would
-            // be built from one measurement, the second association silently
-            // overwriting the first. The loser keeps `observation_kf_indices =
-            // [curr_kf]` while `curr_kf` no longer references it — desyncing
-            // the two directions that `fuse_into_neighbors` uses as its
-            // "already observes" test — and enters BA with a single
-            // observation, i.e. 2 residuals for 3 DoF.
+            // the write phase, so it cannot see duplicates created in the same
+            // batch: two distinct 3D points at different depths would be built
+            // from one measurement. kornia-slam's map now refuses the second
+            // link to an occupied feature (`FeatureOccupied`), so the loser
+            // would no longer desync the two association directions — but it
+            // would still be a wasted triangulation and a counted refusal, so
+            // claim each `curr_idx` once here.
             let mut claimed_curr: HashSet<usize> = HashSet::new();
             for (prev_sub, curr_sub) in sub_matches {
                 let (Some(&prev_idx), Some(&curr_idx)) =
@@ -2523,32 +2866,61 @@ impl Tracker {
                     continue;
                 }
                 let color = keypoint_color(&curr_kf.frame, curr_idx);
-                points.push((
-                    tp.position,
-                    curr_kf.frame.features.descriptors[curr_idx],
-                    color,
-                    prev_idx,
-                    curr_idx,
-                ));
+                points.push((tp.position, color, prev_idx, curr_idx));
             }
             points
         };
 
-        // Write phase. `curr_kf` is registered as the first observer inside
-        // `add_triangulated_points`.
-        let first_mp_idx = self.map.num_map_points();
-        let added = self.map.add_triangulated_points(None, curr_kf, &points);
-
-        // Register the neighbour as a second observer: without it every new
-        // point has a single observation, which biases the scale/normal geometry
-        // and makes `cull()` over-aggressive.
-        for (i, &(_, _, _, prev_desc_idx, _)) in points.iter().take(added).enumerate() {
-            let mp_idx = first_mp_idx + i;
-            self.map
-                .register_observation_at(mp_idx, prev_kf_idx, prev_desc_idx);
-            if let Some(prev_live) = self.map.get_keyframe_mut(prev_kf_idx) {
-                prev_live.associate_map_point(prev_desc_idx, mp_idx);
+        // Write phase. `curr_kf` is each new point's reference (first) observer, as ORB-SLAM3
+        // references a new point to the newer keyframe; the neighbour is linked as the second
+        // observer, without which every new point has a single observation, which biases the
+        // scale/normal geometry and makes culling over-aggressive.
+        let (mut added, mut refused) = (0usize, 0u64);
+        for (position, color, prev_idx, curr_idx) in points {
+            let seed = LandmarkSeed {
+                position,
+                color,
+                reference: ObservationKey {
+                    keyframe_idx: curr_kf_idx,
+                    feature_idx: curr_idx,
+                },
+            };
+            let mp_idx = match self.map.insert_landmark(seed) {
+                Ok(mp_idx) => mp_idx,
+                Err(e) => {
+                    refused += 1;
+                    debug!(
+                        "grow: map refused a landmark: kf={} feature={} error={}",
+                        curr_kf_idx,
+                        curr_idx,
+                        e.to_string()
+                    );
+                    continue;
+                }
+            };
+            added += 1;
+            // A refused second link leaves a valid single-observation point, the state the
+            // point is in anyway until the neighbour is linked.
+            if let Err(e) = self.map.link_observation(prev_kf_idx, prev_idx, mp_idx) {
+                refused += 1;
+                debug!(
+                    "grow: map refused the neighbour observation: kf={} feature={} map_point={} error={}",
+                    prev_kf_idx,
+                    prev_idx,
+                    mp_idx,
+                    e.to_string()
+                );
             }
+        }
+        if refused > 0 {
+            self.map_writes_refused += refused;
+            warning!(
+                "grow: map refused writes: prev_kf={} kf={} refused={} added={}",
+                prev_kf_idx,
+                curr_kf_idx,
+                refused,
+                added
+            );
         }
 
         added
@@ -2573,6 +2945,7 @@ impl Tracker {
 
         let r2 = FUSE_SEARCH_RADIUS_PX * FUSE_SEARCH_RADIUS_PX;
         let mut n_fused = 0usize;
+        let mut refused = 0u64;
 
         for &nb_kf_idx in neighbor_kf_indices {
             if nb_kf_idx == curr_kf_idx {
@@ -2592,7 +2965,7 @@ impl Tracker {
                         Some(mp) if !mp.culled => mp,
                         _ => continue,
                     };
-                    if mp.observation_kf_indices.contains(&nb_kf_idx) {
+                    if mp.is_observed_by(nb_kf_idx) {
                         continue;
                     }
 
@@ -2653,13 +3026,31 @@ impl Tracker {
                 if already {
                     continue;
                 }
-                self.map.register_observation_at(mp_idx, nb_kf_idx, kp_idx);
-                if let Some(nb_live) = self.map.get_keyframe_mut(nb_kf_idx) {
-                    nb_live.associate_map_point(kp_idx, mp_idx);
+                // Links both directions at once: the neighbour's feature slot and the point's
+                // observation record, which the "already observes" test above reads.
+                if let Err(e) = self.map.link_observation(nb_kf_idx, kp_idx, mp_idx) {
+                    refused += 1;
+                    debug!(
+                        "fuse: map refused a link: kf={} feature={} map_point={} error={}",
+                        nb_kf_idx,
+                        kp_idx,
+                        mp_idx,
+                        e.to_string()
+                    );
+                    continue;
                 }
                 taken_kp.insert(kp_idx);
                 n_fused += 1;
             }
+        }
+        if refused > 0 {
+            self.map_writes_refused += refused;
+            warning!(
+                "fuse: map refused links: kf={} refused={} fused={}",
+                curr_kf_idx,
+                refused,
+                n_fused
+            );
         }
 
         n_fused
@@ -2966,10 +3357,11 @@ mod tests {
     //
     // These drive `on_keyframe_inertial` directly with a hand-built map rather than through
     // synthetic imagery: what is under test is the ingest contract — which intervals are
-    // refused, and what bounds reach `Map::add_imu_factor` — and none of that depends on how
-    // the keyframes were produced. `add_imu_factor` itself does not validate that its indices
-    // name live keyframes (an unknown index makes the factor silently vanish from the solve
-    // later), so an empty map is a faithful stand-in here and a hazard worth stating.
+    // refused, and what bounds reach the map's `ImuFactor` — and none of that depends on how
+    // the keyframes were produced. The map DOES validate that both endpoints name keyframes it
+    // holds (`Map::apply_insertion`), so every test inserts featureless keyframes at its
+    // endpoints first — including the refusal tests, where a missing endpoint would have the map
+    // refuse the factor whatever the gate under test did. `bare_keyframe` is enough for that.
 
     /// A real epoch, not 0: the whole reason samples are buffered in `u64` nanoseconds is that
     /// this value in `f64` seconds leaves ~400 ns of resolution against a 5 ms sample period.
@@ -3024,14 +3416,28 @@ mod tests {
             rectified_camera(),
             TrackerConfig::new(Length::new::<meter>(0.075)),
         );
+        // kornia-slam links every landmark to a feature of a keyframe it holds, so the ten
+        // landmarks hang off ten features of one keyframe, in slot order.
+        tracker
+            .map
+            .insert_keyframe(keyframe_with_features(0, 10))
+            .expect("a fresh keyframe id");
         for i in 0..10 {
-            let p = Vec3F64::new(i as f64, -(i as f64), 0.5 * i as f64);
-            tracker
+            let slot = tracker
                 .map
-                .push_map_point(kornia_slam::map::MapPoint::new(p, [0; 32], 0, [0; 3], 0));
+                .insert_landmark(LandmarkSeed {
+                    position: Vec3F64::new(i as f64, -(i as f64), 0.5 * i as f64),
+                    color: [0; 3],
+                    reference: ObservationKey {
+                        keyframe_idx: 0,
+                        feature_idx: i,
+                    },
+                })
+                .expect("a free feature and a finite position");
+            assert_eq!(slot, i, "landmark slots are appended in order");
         }
-        tracker.map.map_points_mut()[2].mark_culled();
-        tracker.map.map_points_mut()[7].mark_culled();
+        assert!(tracker.map.remove_landmark(2).expect("a known landmark"));
+        assert!(tracker.map.remove_landmark(7).expect("a known landmark"));
 
         let got: Vec<_> = tracker.newest_live_map_points(5).collect();
         let want: Vec<_> = [5usize, 6, 8, 9]
@@ -3056,7 +3462,8 @@ mod tests {
         for i in 0..6 {
             tracker
                 .map
-                .upsert_keyframe(bare_keyframe(i, Vec3F64::new(0.01 * i as f64, 0.0, 0.0)));
+                .insert_keyframe(bare_keyframe(i, Vec3F64::new(0.01 * i as f64, 0.0, 0.0)))
+                .expect("a fresh keyframe id");
         }
         let gen_before = tracker.world_generation();
 
@@ -3099,7 +3506,8 @@ mod tests {
             for i in 0..kfs {
                 tracker
                     .map
-                    .upsert_keyframe(bare_keyframe(i, Vec3F64::new(0.01 * i as f64, 0.0, 0.0)));
+                    .insert_keyframe(bare_keyframe(i, Vec3F64::new(0.01 * i as f64, 0.0, 0.0)))
+                    .expect("a fresh keyframe id");
             }
             tracker.arm_map_bound(inserted);
             assert_eq!(
@@ -3241,7 +3649,8 @@ mod tests {
         for i in 0..3 {
             tracker
                 .map
-                .upsert_keyframe(bare_keyframe(i, Vec3F64::new(0.01 * i as f64, 0.0, 0.0)));
+                .insert_keyframe(bare_keyframe(i, Vec3F64::new(0.01 * i as f64, 0.0, 0.0)))
+                .expect("a fresh keyframe id");
         }
         tracker.arm_map_bound(true);
         assert!(tracker.pending_map_reset);
@@ -3257,9 +3666,9 @@ mod tests {
         );
     }
 
-    /// A featureless keyframe at `idx` with its camera centre at `centre`. `add_imu_factor`,
-    /// `ready` and `apply_initialization` all read `frame.idx` and `pose_world_to_cam` and
-    /// nothing else, so this is enough to make them do their real work.
+    /// A featureless keyframe at `idx` with its camera centre at `centre`. `apply_insertion`,
+    /// `ready` and `apply_initialization` read `frame.idx`, `pose_world_to_cam` and (`ready`)
+    /// `is_stereo()`, so this is enough to make them do their real work.
     fn bare_keyframe(idx: usize, centre: Vec3F64) -> Keyframe {
         Keyframe::from_frame(Frame {
             idx,
@@ -3281,10 +3690,43 @@ mod tests {
         })
     }
 
+    /// A keyframe at the origin with `n` distinct features, for tests that need landmarks: the
+    /// map links a landmark only to a feature that has both a descriptor and a keypoint.
+    fn keyframe_with_features(idx: usize, n: usize) -> Keyframe {
+        Keyframe::from_frame(Frame {
+            idx,
+            features: kornia_imgproc::features::OrbFeatures {
+                keypoints_xy: (0..n).map(|i| [10.0 * i as f32, 10.0]).collect(),
+                orientations: vec![0.0; n],
+                descriptors: (0..n).map(|i| [i as u8; 32]).collect(),
+                octaves: vec![0; n],
+            },
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
+                width: 640,
+                height: 400,
+            },
+            keypoint_colors: vec![[0; 3]; n],
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: Vec::new(),
+        })
+    }
+
+    /// Featureless keyframes at `indices`, for the IMU-edge endpoints the map requires.
+    fn insert_bare_keyframes(tracker: &mut Tracker, indices: &[usize]) {
+        for &i in indices {
+            tracker
+                .map
+                .insert_keyframe(bare_keyframe(i, Vec3F64::new(0.01 * i as f64, 0.0, 0.0)))
+                .expect("a fresh keyframe id");
+        }
+    }
+
     /// What `try_initialize` hands back when its gates pass. Gravity deliberately OFF world
     /// +y and scale deliberately not 1, so that `apply_initialization` — if it runs — cannot
-    /// be a no-op on the map: `rotate_world` gets a non-identity rotation and `scale_world` a
-    /// non-unit factor.
+    /// be a no-op on the map: `apply_inertial_alignment` gets a non-identity rotation and a
+    /// non-unit scale.
     fn accepted_init() -> ImuInitResult {
         ImuInitResult {
             scale: 1.7,
@@ -3394,9 +3836,10 @@ mod tests {
         tracker
             .push_raw_imu(imu_samples(t0_ns, 200), 0, false)
             .expect("inertial path is on");
+        insert_bare_keyframes(&mut tracker, &[7, 11]);
 
         let handles = tracker.on_keyframe_inertial(Some((7, t0_ns)), 11, t1_ns);
-        // Not initialized yet (no keyframes, so `ready` is false), so BA stays visual.
+        // Not initialized yet (no window armed, so the ladder does not run), so BA stays visual.
         assert!(handles.is_none());
 
         let factors = tracker.map().imu_factors();
@@ -3421,8 +3864,9 @@ mod tests {
             f.raw_samples.first().unwrap().timestamp >= f.t0
                 && f.raw_samples.last().unwrap().timestamp <= f.t1
         );
-        // Retained on the factor, which is what `Map`'s repropagation path re-integrates once
-        // the bias has drifted past its linearization point. An empty Vec would compile.
+        // Retained on the factor, which is what the inertial BA's 0.02 repropagation
+        // re-integrates once the bias has drifted past its linearization point. An empty Vec
+        // would compile.
         assert!(!f.raw_samples.is_empty());
 
         let stats = tracker.inertial_stats().unwrap();
@@ -3449,6 +3893,7 @@ mod tests {
             .push_raw_imu(imu_samples(stamp(0), 600), 0, false)
             .unwrap();
         // Two edges: 3 -> 4 lands before a window opened at 5, and 7 -> 8 lands inside it.
+        insert_bare_keyframes(&mut tracker, &[3, 4, 7, 8]);
         tracker.on_keyframe_inertial(Some((3, stamp(0))), 4, stamp(1));
         tracker.on_keyframe_inertial(Some((7, stamp(1))), 8, stamp(2));
         assert_eq!(tracker.map().imu_factors().len(), 2);
@@ -3485,6 +3930,7 @@ mod tests {
         tracker
             .push_raw_imu(imu_samples(t0_ns + 100 * IMU_PERIOD_NS, 100), 12, false)
             .unwrap();
+        insert_bare_keyframes(&mut tracker, &[7, 11]);
 
         let handles = tracker.on_keyframe_inertial(Some((7, t0_ns)), 11, t1_ns);
         assert!(handles.is_none());
@@ -3494,6 +3940,8 @@ mod tests {
         );
         let stats = tracker.inertial_stats().unwrap();
         assert_eq!(stats.refused_dropped, 1);
+        // The gate refused it, not the map.
+        assert_eq!(stats.refused_by_map, 0);
         assert_eq!(stats.factors_added, 0);
         // Still pruned: the refusal must not let the buffer grow without bound.
         assert_eq!(stats.buffer.buffered, 80);
@@ -3508,10 +3956,83 @@ mod tests {
         // coverage count can catch it.
         let thinned: Vec<RawImuSample> = imu_samples(t0_ns, 200).into_iter().step_by(2).collect();
         tracker.push_raw_imu(thinned, 0, false).unwrap();
+        insert_bare_keyframes(&mut tracker, &[7, 11]);
 
         tracker.on_keyframe_inertial(Some((7, t0_ns)), 11, t1_ns);
         assert!(tracker.map().imu_factors().is_empty());
-        assert_eq!(tracker.inertial_stats().unwrap().refused_too_few, 1);
+        let stats = tracker.inertial_stats().unwrap();
+        assert_eq!(stats.refused_too_few, 1);
+        assert_eq!(stats.refused_by_map, 0);
+    }
+
+    /// An edge naming a keyframe the map does not hold used to be pushed anyway and vanish from
+    /// the solve later; kornia-slam's map now refuses it. The refusal must be counted, not
+    /// reported as an added factor.
+    #[test]
+    fn test_an_edge_to_a_keyframe_the_map_lacks_is_refused_and_counted() {
+        let mut tracker = tracker_with_inertial();
+        let t0_ns = EPOCH_NS + 1_000_000_000;
+        let t1_ns = EPOCH_NS + 1_600_000_000;
+        tracker
+            .push_raw_imu(imu_samples(t0_ns, 200), 0, false)
+            .unwrap();
+        // Only the newer endpoint exists.
+        insert_bare_keyframes(&mut tracker, &[11]);
+
+        tracker.on_keyframe_inertial(Some((7, t0_ns)), 11, t1_ns);
+        assert!(tracker.map().imu_factors().is_empty());
+        let stats = tracker.inertial_stats().unwrap();
+        assert_eq!(stats.factors_added, 0);
+        assert_eq!(stats.refused_by_map, 1);
+        assert_eq!(
+            stats.refused_total(),
+            1,
+            "the total must see the new counter"
+        );
+    }
+
+    /// An initialization the map refuses (here: no keyframe velocities) must leave everything as
+    /// it was — map, bias, gravity, generation — and the tracker visual-only, with the refusal
+    /// counted rather than reported as an acceptance.
+    #[test]
+    fn test_a_refused_initialization_leaves_the_tracker_visual_only() {
+        let mut tracker = tracker_with_inertial_ba(true);
+        tracker
+            .map
+            .insert_keyframe(bare_keyframe(3, Vec3F64::new(0.5, -0.25, 2.0)))
+            .expect("a fresh keyframe id");
+        tracker.arm_inertial_window(3, 0.0, EPOCH_NS);
+        let pose_before = pose_bits(&tracker.map.keyframes()[0].frame.pose_world_to_cam);
+        let refused = ImuInitResult {
+            velocities_world: Vec::new(),
+            ..accepted_init()
+        };
+
+        let mut inert = tracker.inertial.take().unwrap();
+        tracker.accept_inertial_init(&mut inert, refused, 3, 2.5, InitStage::Initial);
+        tracker.inertial = Some(inert);
+
+        assert_eq!(
+            pose_bits(&tracker.map.keyframes()[0].frame.pose_world_to_cam),
+            pose_before
+        );
+        assert_eq!(tracker.world_generation(), 0);
+        assert!(!tracker.state.imu_initialized);
+        assert!(tracker.state.imu_init_timestamp_sec.is_none());
+        let inert = tracker.inertial.as_ref().unwrap();
+        assert_eq!(
+            (inert.bias.gyro, inert.bias.accel),
+            (inert.cfg.initial_bias.gyro, inert.cfg.initial_bias.accel)
+        );
+        assert_eq!(
+            inert.gravity_world,
+            Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE)
+        );
+        assert_eq!(inert.stats.init_accepted, 0);
+        assert_eq!(inert.stats.init_apply_refused, 1);
+        // And local BA stays on the visual path.
+        let handles = tracker.on_keyframe_inertial(None, 4, EPOCH_NS + 3_000_000_000);
+        assert!(handles.is_none());
     }
 
     #[test]
@@ -3537,7 +4058,10 @@ mod tests {
     fn test_with_inertial_ba_off_an_accepted_initialization_is_counted_but_never_applied() {
         let mut tracker = tracker_with_inertial_ba(false);
         let centre = Vec3F64::new(0.5, -0.25, 2.0);
-        tracker.map.upsert_keyframe(bare_keyframe(3, centre));
+        tracker
+            .map
+            .insert_keyframe(bare_keyframe(3, centre))
+            .expect("a fresh keyframe id");
         tracker.state.pose_world_to_cam = tracker.map.keyframes()[0].frame.pose_world_to_cam;
         tracker.arm_inertial_window(3, 0.0, EPOCH_NS);
         let pose_before = pose_bits(&tracker.map.keyframes()[0].frame.pose_world_to_cam);
@@ -3590,14 +4114,25 @@ mod tests {
     fn test_with_inertial_ba_on_an_accepted_initialization_rotates_the_map() {
         let mut tracker = tracker_with_inertial_ba(true);
         let centre = Vec3F64::new(0.5, -0.25, 2.0);
-        tracker.map.upsert_keyframe(bare_keyframe(3, centre));
+        tracker
+            .map
+            .insert_keyframe(bare_keyframe(3, centre))
+            .expect("a fresh keyframe id");
         tracker.arm_inertial_window(3, 0.0, EPOCH_NS);
         let pose_before = pose_bits(&tracker.map.keyframes()[0].frame.pose_world_to_cam);
+        // A motion model from before the alignment, which moves the frame it was measured in.
+        tracker.state.velocity = Some(Pose3d::IDENTITY);
 
         let mut inert = tracker.inertial.take().unwrap();
         tracker.accept_inertial_init(&mut inert, accepted_init(), 3, 2.5, InitStage::Initial);
         tracker.inertial = Some(inert);
 
+        // Adoption resumes from the aligned keyframe and drops the stale motion model.
+        assert_eq!(
+            pose_bits(&tracker.state.pose_world_to_cam),
+            pose_bits(&tracker.map.keyframes()[0].frame.pose_world_to_cam)
+        );
+        assert!(tracker.state.velocity.is_none());
         assert_ne!(
             pose_bits(&tracker.map.keyframes()[0].frame.pose_world_to_cam),
             pose_before,
@@ -3633,7 +4168,8 @@ mod tests {
         for i in 0..N {
             tracker
                 .map
-                .upsert_keyframe(bare_keyframe(i, Vec3F64::new(0.03 * i as f64, 0.0, 0.0)));
+                .insert_keyframe(bare_keyframe(i, Vec3F64::new(0.03 * i as f64, 0.0, 0.0)))
+                .expect("a fresh keyframe id");
         }
         // Samples covering the whole span at 200 Hz, plus a margin past the last stamp.
         let n_samples = (N as u64 * STEP_NS / IMU_PERIOD_NS) as usize + 10;
@@ -3786,5 +4322,348 @@ mod tests {
 
         tracker.arm_inertial_window(7, 1.0, EPOCH_NS);
         assert!(tracker.inertial.as_ref().unwrap().last_window_log.is_none());
+    }
+
+    /// Every field of the locally owned `SystemState`, set, then reset: what kornia-slam's own
+    /// `reset` keeps (the pose the re-bootstrap re-anchors at, the frame clock) and what it
+    /// clears. A struct literal, so a new field cannot be added without choosing its side.
+    #[test]
+    fn test_system_state_reset_keeps_the_pose_and_clears_everything_else() {
+        let pose = Pose3d::from_rt(Mat3F64::IDENTITY, Vec3F64::new(1.0, -2.0, 3.0));
+        let mut state = SystemState {
+            pose_world_to_cam: pose,
+            velocity: Some(Pose3d::IDENTITY),
+            velocity_world: Vec3F64::new(0.4, 0.0, 0.0),
+            last_frame_timestamp_sec: 4.5,
+            imu_initialized: true,
+            imu_init_timestamp_sec: Some(1.5),
+            current_keyframe_idx: Some(5),
+            last_keyframe_idx: Some(6),
+            lost_since_sec: Some(3.0),
+            mode: SystemMode::Tracking,
+        };
+        state.reset();
+
+        assert_eq!(pose_bits(&state.pose_world_to_cam), pose_bits(&pose));
+        assert_eq!(state.last_frame_timestamp_sec, 4.5);
+
+        assert_eq!(state.mode, SystemMode::Bootstrap);
+        assert!(state.velocity.is_none());
+        assert_eq!(state.velocity_world, Vec3F64::ZERO);
+        assert!(
+            !state.imu_initialized,
+            "the re-anchored map needs a new initialization"
+        );
+        assert!(state.imu_init_timestamp_sec.is_none());
+        assert!(state.current_keyframe_idx.is_none());
+        assert!(state.last_keyframe_idx.is_none());
+        assert!(state.lost_since_sec.is_none());
+    }
+
+    /// A refinement the map refuses is not a de-initialization: the tracker stays on the
+    /// previous initialization (inertial BA keeps running on it), the world does not move, and
+    /// the stage is marked done so it is not re-solved every keyframe.
+    #[test]
+    fn test_a_refused_refinement_keeps_the_previous_initialization_and_is_not_retried() {
+        let mut tracker = tracker_with_inertial_ba(true);
+        tracker
+            .map
+            .insert_keyframe(bare_keyframe(3, Vec3F64::new(0.5, -0.25, 2.0)))
+            .expect("a fresh keyframe id");
+        tracker.arm_inertial_window(3, 0.0, EPOCH_NS);
+        let mut inert = tracker.inertial.take().unwrap();
+        tracker.accept_inertial_init(&mut inert, accepted_init(), 3, 2.5, InitStage::Initial);
+        assert!(tracker.state.imu_initialized);
+        let generation = tracker.world_generation();
+        let bias = inert.bias;
+
+        let refused = ImuInitResult {
+            velocities_world: Vec::new(),
+            ..accepted_init()
+        };
+        tracker.finish_refinement(&mut inert, Some(refused), 3, 6.0, InitStage::Refine1);
+        tracker.inertial = Some(inert);
+
+        assert!(tracker.state.imu_initialized);
+        assert_eq!(tracker.world_generation(), generation);
+        let inert = tracker.inertial.as_ref().unwrap();
+        assert_eq!((inert.bias.gyro, inert.bias.accel), (bias.gyro, bias.accel));
+        assert!(
+            inert.stats.first_refinement_done,
+            "a refused stage is not retried"
+        );
+        assert!(!inert.stats.second_refinement_done);
+        assert_eq!(
+            (inert.stats.init_accepted, inert.stats.init_apply_refused),
+            (1, 1)
+        );
+        // Inertial BA stays selected.
+        let handles = tracker.on_keyframe_inertial(None, 4, EPOCH_NS + 7_000_000_000);
+        assert!(handles.is_some());
+    }
+
+    /// One NaN accelerometer reading must not reach the map. A factor carrying it is admitted by
+    /// `Map::apply_insertion`, and `Map::apply_ba_update` then validates every factor in the map
+    /// and refuses every later BA write-back — visual BA included, with inertial BA off — until
+    /// the map drops.
+    #[test]
+    fn test_a_non_finite_imu_sample_gives_no_factor_and_leaves_visual_ba_writable() {
+        let mut tracker = tracker_with_inertial_ba(false);
+        let t0_ns = EPOCH_NS + 1_000_000_000;
+        let t1_ns = EPOCH_NS + 1_600_000_000;
+        let mut samples = imu_samples(t0_ns, 200);
+        samples[40].accel[1] = f64::NAN;
+        tracker.push_raw_imu(samples, 0, false).unwrap();
+        insert_bare_keyframes(&mut tracker, &[7, 11]);
+
+        tracker.on_keyframe_inertial(Some((7, t0_ns)), 11, t1_ns);
+        assert!(tracker.map().imu_factors().is_empty());
+        let stats = tracker.inertial_stats().unwrap();
+        assert_eq!(stats.buffer.non_finite, 1);
+        assert_eq!(
+            stats.refused_dropped, 1,
+            "the reading is a hole in its interval"
+        );
+        assert_eq!(stats.factors_added, 0);
+
+        // Later keyframes, so the interval is outside any BA window.
+        insert_bare_keyframes(&mut tracker, &[12, 13, 14, 15]);
+        let update = run_local_ba(tracker.map.ba_snapshot(), &tracker.camera);
+        tracker
+            .map
+            .apply_ba_update(update)
+            .expect("visual BA must stay writable");
+    }
+
+    /// Duplicate tracked claims are reachable (`estimate_pose`'s reference-keyframe fallback
+    /// matches one-directionally), and are resolved first-claim-wins before the links, as
+    /// upstream's `keyframe_insertion` resolves them — not handed to the map as refusals.
+    #[test]
+    fn test_duplicate_tracked_claims_link_the_first_and_are_not_refusals() {
+        let mut tracker = Tracker::new(
+            rectified_camera(),
+            TrackerConfig::new(Length::new::<meter>(0.075)),
+        );
+        tracker
+            .map
+            .insert_keyframe(keyframe_with_features(0, 4))
+            .expect("a fresh keyframe id");
+        for i in 0..3 {
+            tracker
+                .map
+                .insert_landmark(LandmarkSeed {
+                    position: Vec3F64::new(0.1 * i as f64, 0.0, 2.0),
+                    color: [0; 3],
+                    reference: ObservationKey {
+                        keyframe_idx: 0,
+                        feature_idx: i,
+                    },
+                })
+                .expect("a free feature and a finite position");
+        }
+        tracker.state.current_keyframe_idx = Some(0);
+        tracker.state.last_keyframe_idx = Some(0);
+        tracker.state.mode = SystemMode::Tracking;
+
+        // (landmark, feature): landmarks 0 and 1 both claim feature 2, and landmark 0 also
+        // claims feature 1.
+        let matches = [(0, 2), (1, 2), (0, 1), (2, 3)];
+        let frame = keyframe_with_features(10, 4).frame;
+        assert!(tracker.try_insert_keyframe(&frame, 0.6, EPOCH_NS, 100, &matches));
+
+        assert_eq!(tracker.map_writes_refused(), 0);
+        let kf = tracker.map.get_keyframe(10).expect("inserted");
+        assert_eq!(kf.map_point(2), Some(0), "the first claim wins");
+        assert_eq!(kf.map_point(1), None, "landmark 0 already holds a feature");
+        assert_eq!(kf.map_point(3), Some(2));
+    }
+
+    // ── End to end ───────────────────────────────────────────────────────────
+    //
+    // Through `process_stereo`, on the example's scene: the only tests that reach keyframe
+    // insertion, the map's link/insert contracts and the snapshot -> solve -> `apply_ba_update`
+    // path together.
+
+    /// Metres the scene camera moves along +x per frame: an eighth of the 0.1 m baseline, so
+    /// each band shifts `disparity / 8` whole pixels and the rendering needs no interpolation.
+    const SCENE_STEP_M: f64 = 0.1 / 8.0;
+
+    /// The example's calibration (`examples/stereo_vio.rs`): 320x240, fx = fy = 300.
+    fn scene_tracker(inertial: Option<InertialConfig>) -> Tracker {
+        let mut config = TrackerConfig::new(Length::new::<meter>(0.1));
+        config.inertial = inertial;
+        let camera = PinholeCamera {
+            fx: 300.0,
+            fy: 300.0,
+            cx: 160.0,
+            cy: 120.0,
+            ..rectified_camera()
+        };
+        let mut tracker = Tracker::new(camera, config);
+        tracker.epoch_ns = Some(EPOCH_NS);
+        tracker
+    }
+
+    /// Frame `seq` of the example's scene: a 2x2-cell texture in three depth bands (16, 24 and
+    /// 32 px disparity), the camera `seq * SCENE_STEP_M` along +x. The same scene as
+    /// `trackable_frame` in the task tests.
+    fn scene_pair(seq: u32) -> (Image<u8, 1>, Image<u8, 1>, CuTime) {
+        const BANDS: [u32; 3] = [16, 24, 32];
+        const W: u32 = 320;
+        const H: u32 = 240;
+        let texture = |x: u32, y: u32| {
+            let h = (x / 2).wrapping_mul(73_856_093) ^ (y / 2).wrapping_mul(19_349_663);
+            (h.wrapping_mul(2_654_435_761) >> 24) as u8
+        };
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        for y in 0..H {
+            let d = BANDS[((y / (H / 3)) as usize).min(2)];
+            let shift = seq * (d / 8);
+            for x in 0..W {
+                left.push(texture(x + shift, y));
+                right.push(texture(x + d + shift, y));
+            }
+        }
+        let size = ImageSize {
+            width: W as usize,
+            height: H as usize,
+        };
+        (
+            Image::new(size, left).expect("sized"),
+            Image::new(size, right).expect("sized"),
+            CuTime::from_nanos(EPOCH_NS + u64::from(seq) * 66_666_667),
+        )
+    }
+
+    fn feed(tracker: &mut Tracker, seq: u32) -> TrackStatus {
+        let (left, right, stamp) = scene_pair(seq);
+        tracker
+            .process_stereo(&left, &right, stamp)
+            .expect("a valid pair")
+    }
+
+    #[test]
+    fn test_the_synthetic_scene_tracks_through_keyframe_insertion_and_local_ba() {
+        let mut tracker = scene_tracker(None);
+        let mut bootstrap_landmarks = 0;
+        let mut worst_m = 0.0f64;
+        for seq in 0..40 {
+            let TrackStatus::Tracked(pose) = feed(&mut tracker, seq) else {
+                panic!("frame {seq} was not tracked");
+            };
+            if seq == 0 {
+                bootstrap_landmarks = tracker.map().map_points().len();
+                assert!(bootstrap_landmarks > 0);
+            }
+            let truth = Vec3F64::new(SCENE_STEP_M * f64::from(seq), 0.0, 0.0);
+            worst_m = worst_m.max((pose.cam_in_world().translation - truth).length());
+        }
+
+        // Every write this path made was accepted, BA included.
+        assert_eq!(tracker.map_writes_refused(), 0);
+        assert_eq!(tracker.ba_updates_refused(), 0);
+        let kfs = tracker.map().keyframes();
+        assert!(
+            kfs.len() > BA_ACTIVE_KEYFRAMES,
+            "{} keyframes: local BA never ran",
+            kfs.len()
+        );
+        // Tracked matches were linked into the newest keyframe: it observes landmarks the
+        // bootstrap keyframe created.
+        let newest = kfs.last().unwrap();
+        assert!(
+            newest
+                .map_point_by_desc_idx
+                .iter()
+                .flatten()
+                .any(|&mp| mp < bootstrap_landmarks),
+            "the newest keyframe holds no bootstrap landmark"
+        );
+        // Metric and unaligned: the baseline fixes the scale and the bootstrap fixes the frame.
+        assert!(worst_m < 0.005, "worst camera-centre error {worst_m} m");
+    }
+
+    /// The bias a map drop keeps, and the velocity once initialized, must survive the keyframes
+    /// inserted after it: `Keyframe::from_frame` zeroes both, and the sync-back after each
+    /// insertion copies the newest keyframe's bias into the next edge's linearization point.
+    #[test]
+    fn test_a_kept_bias_survives_the_keyframes_inserted_after_a_map_drop() {
+        let measured = ImuBias {
+            gyro: Vec3F64::new(0.0026, -0.0011, 0.0009),
+            accel: Vec3F64::new(0.01, -0.02, 0.03),
+        };
+        let mut tracker = scene_tracker(Some(inertial_config()));
+        tracker.inertial.as_mut().unwrap().bias = measured;
+        tracker.reset_keeping_calibration();
+
+        // The bootstrap keyframe, then the one the keyframe policy forces at an 8-frame gap.
+        for seq in 0..10 {
+            feed(&mut tracker, seq);
+        }
+        let kfs = tracker.map().keyframes();
+        assert!(kfs.len() >= 2, "{} keyframes", kfs.len());
+        for kf in kfs {
+            assert_eq!(
+                (kf.imu_bias.gyro, kf.imu_bias.accel),
+                (measured.gyro, measured.accel),
+                "keyframe {} was not seeded with the kept bias",
+                kf.frame.idx
+            );
+        }
+        let bias = tracker.inertial.as_ref().unwrap().bias;
+        assert_eq!((bias.gyro, bias.accel), (measured.gyro, measured.accel));
+
+        // Once initialized, the current velocity seeds the next keyframe too.
+        let velocity = Vec3F64::new(0.2, 0.0, -0.1);
+        tracker.state.imu_initialized = true;
+        tracker.state.velocity_world = velocity;
+        let kf = tracker.seeded_keyframe(tracker.map().keyframes()[0].frame.clone());
+        assert_eq!(kf.velocity_world, velocity);
+        assert_eq!(kf.imu_bias.gyro, measured.gyro);
+    }
+
+    /// When a loss's re-bootstrap into the KEPT map cannot anchor on the loss frame itself, the
+    /// next frame that does anchor is the same dead-reckoned coast and must be `Untracked` too.
+    /// A dropped map needs no deferral: its fresh world starts at identity.
+    #[test]
+    fn test_a_deferred_loss_re_bootstrap_is_not_published_as_measured() {
+        for reset_map_on_loss in [false, true] {
+            let mut tracker = scene_tracker(None);
+            tracker.config.reset_map_on_loss = reset_map_on_loss;
+            assert!(matches!(feed(&mut tracker, 0), TrackStatus::Tracked(_)));
+
+            // A blank pair: tracking fails and, with one keyframe (no established map), the
+            // loss path runs at once; its re-bootstrap on this featureless frame fails too.
+            let blank = Image::from_size_val(
+                ImageSize {
+                    width: 320,
+                    height: 240,
+                },
+                0u8,
+            )
+            .unwrap();
+            let stamp = CuTime::from_nanos(EPOCH_NS + 66_666_667);
+            let status = tracker.process_stereo(&blank, &blank, stamp).unwrap();
+            assert!(matches!(status, TrackStatus::Untracked));
+            assert_eq!(tracker.mode(), SystemMode::Bootstrap);
+
+            // The camera has not moved (an occlusion), so the re-anchor is where it should be;
+            // what is under test is only whether it is reported as a measurement.
+            let (left, right, _) = scene_pair(0);
+            let stamp = CuTime::from_nanos(EPOCH_NS + 2 * 66_666_667);
+            let status = tracker.process_stereo(&left, &right, stamp).unwrap();
+            assert_eq!(tracker.mode(), SystemMode::Tracking);
+            assert_eq!(
+                matches!(status, TrackStatus::Untracked),
+                !reset_map_on_loss,
+                "reset_map_on_loss={reset_map_on_loss}: {status:?}"
+            );
+
+            // The next frame tracks against the re-anchored map and is measured again.
+            let (left, right, _) = scene_pair(1);
+            let stamp = CuTime::from_nanos(EPOCH_NS + 3 * 66_666_667);
+            let status = tracker.process_stereo(&left, &right, stamp).unwrap();
+            assert!(matches!(status, TrackStatus::Tracked(_)), "{status:?}");
+        }
     }
 }

@@ -3,8 +3,9 @@
 //! Deliberately separable layers:
 //!
 //! * [`track`]: the composition root over kornia-slam. kornia-slam ships stereo matching, the
-//!   map, map-projection PnP and bundle adjustment, but its orchestration lives in an
-//!   unreachable example binary; this is that orchestration, written for a live camera. It uses
+//!   map, map-projection PnP and bundle adjustment, but its own orchestration
+//!   (`kornia_slam::SlamSystem`) keeps its tracking state private and cannot be driven piece by
+//!   piece; this is an orchestration over the same parts, written for a live camera. It uses
 //!   no copper runtime or graph types (no `CuMsg`, no tasks), only the cu29 unit types, `CuTime`
 //!   and the logging macros, so it runs without a graph.
 //! * [`task`]: the `CuTask` shell that drives it from a copper graph. It owns only the
@@ -47,4 +48,4 @@ pub use imu_channel::ImuQueue;
 pub use reset::ResetEpoch;
 pub use task::{DEFAULT_LANDMARK_BUFFERS, MAX_LANDMARK_BUFFERS, MAX_LANDMARKS, StereoVio};
 pub use task_error::{Eye, TaskError};
-pub use track::{TrackStatus, TrackedPose, Tracker, TrackerConfig, TrackerStats};
+pub use track::{SystemMode, TrackStatus, TrackedPose, Tracker, TrackerConfig, TrackerStats};

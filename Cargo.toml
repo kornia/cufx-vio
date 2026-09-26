@@ -62,12 +62,12 @@ cu-stereo-payloads = { path = "crates/cu-stereo-payloads" }
 # mistake available here.
 kornia-slam = { git = "https://github.com/kornia/kornia-slam", branch = "develop" }
 # The IMU types (`ImuMeasurement`, `ImuBias`, `ImuCalib`, `PreintegratedImu`) are NOT re-exported
-# by kornia-slam — `Map::add_imu_factor` and `ImuInitializer::try_initialize` take them by name
-# from this crate, so naming them here is the only way to call those APIs. It is a workspace
-# member of the kornia-slam repo, so the spec string MUST be spelled exactly as the line above:
-# a different spelling is a different cargo source, which would make `ImuBias` here a DIFFERENT
-# type from the `ImuBias` in `add_imu_factor`'s signature, with a type error that names the same
-# path twice.
+# by kornia-slam — `ImuFactor::{preintegrated, raw_samples}` (inserted via `Map::apply_insertion`)
+# and `ImuInitializer::{try_initialize, apply_initialization}` name them from this crate, so naming
+# them here is the only way to call those APIs. It is a workspace member of the kornia-slam repo,
+# so the spec string MUST be spelled exactly as the line above: a different spelling is a
+# different cargo source, which would make `ImuBias` here a DIFFERENT type from the `ImuBias` in
+# `ImuFactor`, with a type error that names the same path twice.
 kornia-sensors = { git = "https://github.com/kornia/kornia-slam", branch = "develop" }
 kornia-image = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 kornia-3d = { git = "https://github.com/kornia/kornia-rs", branch = "main" }

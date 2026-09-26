@@ -187,7 +187,9 @@ It applies in three directions:
   `https://github.com/kornia/cu-kornia-vio` everywhere.
 
 `Cargo.lock` is tracked so that a clean clone builds: it holds a kornia-rs / kornia-slam pair
-known to compile together. A consumer's own lock still wins.
+known to compile together (kornia-rs v0.1.15 at `c9f9fd7`, kornia-slam develop at `c94e2a8`). A
+consumer's own lock still wins, but a kornia-slam from before its map-API rework (which
+`c94e2a8` includes) does not compile against this crate.
 
 ## Known limitations
 
