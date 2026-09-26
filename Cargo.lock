@@ -1621,8 +1621,8 @@ dependencies = [
 
 [[package]]
 name = "kornia-3d"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#5214f3a437b9f269c0ffc137956a99d58c6ee0c0"
+version = "0.1.15"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#c9f9fd7b407bc791afc6a0d09b52a80e61a694fc"
 dependencies = [
  "bincode",
  "faer 0.24.4",
@@ -1640,8 +1640,8 @@ dependencies = [
 
 [[package]]
 name = "kornia-algebra"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#5214f3a437b9f269c0ffc137956a99d58c6ee0c0"
+version = "0.1.15"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#c9f9fd7b407bc791afc6a0d09b52a80e61a694fc"
 dependencies = [
  "glam 0.33.7",
  "nalgebra",
@@ -1651,8 +1651,8 @@ dependencies = [
 
 [[package]]
 name = "kornia-bow"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#5214f3a437b9f269c0ffc137956a99d58c6ee0c0"
+version = "0.1.15"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#c9f9fd7b407bc791afc6a0d09b52a80e61a694fc"
 dependencies = [
  "bincode",
  "rand 0.10.2",
@@ -1664,8 +1664,8 @@ dependencies = [
 
 [[package]]
 name = "kornia-image"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#5214f3a437b9f269c0ffc137956a99d58c6ee0c0"
+version = "0.1.15"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#c9f9fd7b407bc791afc6a0d09b52a80e61a694fc"
 dependencies = [
  "kornia-tensor",
  "num-traits",
@@ -1675,8 +1675,8 @@ dependencies = [
 
 [[package]]
 name = "kornia-imgproc"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#5214f3a437b9f269c0ffc137956a99d58c6ee0c0"
+version = "0.1.15"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#c9f9fd7b407bc791afc6a0d09b52a80e61a694fc"
 dependencies = [
  "kornia-algebra",
  "kornia-image",
@@ -1690,7 +1690,7 @@ dependencies = [
 [[package]]
 name = "kornia-sensors"
 version = "0.1.0"
-source = "git+https://github.com/kornia/kornia-slam?branch=develop#294b00b14860b79dd0e1c11ba86de9f06f2b0227"
+source = "git+https://github.com/kornia/kornia-slam?branch=develop#c94e2a89473e925198c5cfb2c9912cddc41a02c6"
 dependencies = [
  "glam 0.33.7",
  "kornia-algebra",
@@ -1699,7 +1699,7 @@ dependencies = [
 [[package]]
 name = "kornia-slam"
 version = "0.1.0"
-source = "git+https://github.com/kornia/kornia-slam?branch=develop#294b00b14860b79dd0e1c11ba86de9f06f2b0227"
+source = "git+https://github.com/kornia/kornia-slam?branch=develop#c94e2a89473e925198c5cfb2c9912cddc41a02c6"
 dependencies = [
  "faer 0.22.6",
  "kornia-3d",
@@ -1713,8 +1713,8 @@ dependencies = [
 
 [[package]]
 name = "kornia-tensor"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#5214f3a437b9f269c0ffc137956a99d58c6ee0c0"
+version = "0.1.15"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#c9f9fd7b407bc791afc6a0d09b52a80e61a694fc"
 dependencies = [
  "num-traits",
  "rayon",

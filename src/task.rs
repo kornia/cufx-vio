@@ -560,9 +560,9 @@ impl CuTask for StereoVio {
         if let Some(stats) = self.tracker.as_ref().and_then(|t| t.inertial_stats()) {
             info!(
                 "vio inertial: {} factors ({} retained, pinning {} raw samples), refused {} \
-                 (dropped {}, gap {}, sparse {}, empty {}, bad-interval {}, zero-dt {}); \
+                 (dropped {}, gap {}, sparse {}, empty {}, bad-interval {}, zero-dt {}, map {}); \
                  samples {} accepted / {} out-of-order / {} evicted, {} drop reports; init {}/{} \
-                 accepted, initialized={} refine_1={} refine_2={}",
+                 accepted ({} refused by the map), initialized={} refine_1={} refine_2={}",
                 stats.factors_added,
                 stats.retained_factors,
                 stats.retained_samples,
@@ -573,12 +573,14 @@ impl CuTask for StereoVio {
                 stats.refused_no_samples,
                 stats.refused_bad_interval,
                 stats.refused_zero_dt,
+                stats.refused_by_map,
                 stats.buffer.accepted,
                 stats.buffer.out_of_order,
                 stats.buffer.evicted,
                 stats.buffer.drop_reports,
                 stats.init_accepted,
                 stats.init_attempts,
+                stats.init_apply_refused,
                 stats.initialized,
                 stats.first_refinement_done,
                 stats.second_refinement_done,

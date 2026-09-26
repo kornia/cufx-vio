@@ -3,7 +3,8 @@
 //!
 //! # Why this exists as a buffer and not as a per-frame delta
 //!
-//! `kornia_slam::map::Map::add_imu_factor` wants an edge spanning
+//! An IMU factor in `kornia_slam::mapping::map::Map` (inserted through `Map::apply_insertion`)
+//! wants an edge spanning
 //! `[previous_keyframe, this_keyframe]` — 0.6-1.0 s measured on a Jetson Orin with an OAK-D at
 //! 640x400, ~120-200 samples at a measured 199.7 Hz — and it keeps the raw samples so the factor
 //! can be re-integrated when the bias estimate moves. Neither a per-frame preintegration nor a
@@ -24,8 +25,8 @@
 //!
 //! # Known limit: `Map::imu_factors` is push-only
 //!
-//! Nothing here bounds the factors once they are in the map. `Map::add_imu_factor` is a bare
-//! `push`, each factor retains its raw samples for repropagation (~8.7 kB per keyframe edge at
+//! Nothing here bounds the factors once they are in the map. `Map::apply_insertion` only
+//! appends factors, each factor retains its raw samples for repropagation (~8.7 kB per keyframe edge at
 //! 200 Hz and 1.7 keyframes/s, so ~53 MB/hour), and the only thing that ever frees them is
 //! `Map::clear_active()` — i.e. a full map reset. With `reset_map_on_loss` enabled that reset
 //! happens on every tracking loss, which is then the only bound on keyframe growth too; without
@@ -48,7 +49,7 @@ use cu29::units::si::time::second;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, Vec3F64};
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement};
-use kornia_slam::estimation::ImuInitConfig;
+use kornia_slam::initialization::ImuInitConfig;
 
 use crate::error::VioError;
 
@@ -428,7 +429,7 @@ impl ImuBuffer {
     /// is no point measuring coverage of an interval the buffer never held.
     ///
     /// Returns a borrowed iterator over the ring rather than a `Vec`: the only owned copy the
-    /// caller needs is the `ImuMeasurement` vector `Map::add_imu_factor` takes, so the samples
+    /// caller needs is the `ImuMeasurement` vector an `ImuFactor` retains, so the samples
     /// are converted once, straight out of the ring. The window's bounds are two binary searches
     /// — the ring is stamp-sorted by construction, which is exactly the invariant [`Self::push`]
     /// pays for by refusing every stamp that does not strictly advance.
@@ -533,7 +534,7 @@ impl ImuBuffer {
 ///   and `apply_initialization` then ROTATES THE WHOLE MAP to align that wrong gravity with
 ///   world +y. The trajectory stays self-consistent and tips over.
 /// * Wrong `calib` densities set the IMU information matrix directly, i.e. the visual/inertial
-///   weighting. `kornia_slam::pipeline` hard-codes EuRoC ADIS16448 values; on a BNO086 those
+///   weighting. kornia-slam's `SensorRig::new` defaults to EuRoC ADIS16448 values; on a BNO086 those
 ///   are not a starting point, they are a different sensor.
 #[derive(Debug, Clone)]
 pub struct InertialConfig {
@@ -555,7 +556,7 @@ pub struct InertialConfig {
     pub gates: ImuGates,
     /// Sample-ring capacity; see `ImuBuffer::with_capacity`.
     pub buffer_capacity: usize,
-    /// Readiness thresholds for `ImuInitializer`. Defaults to `kornia_slam::pipeline`'s
+    /// Readiness thresholds for `ImuInitializer`. Defaults to `kornia_slam::SlamSystem`'s
     /// (10 keyframes / 1.0 s of integrated IMU time / 0.05 m of displacement), which are the
     /// readiness gate for the first inertial-only initialization in Campos et al., ORB-SLAM3,
     /// IEEE T-RO 2021.
@@ -564,7 +565,8 @@ pub struct InertialConfig {
     /// LM over the whole window on every call and the window never shrinks, so an ungated retry
     /// on every keyframe is a growing per-keyframe cost for a solve that just failed.
     pub init_retry: Time,
-    /// Whether to switch local BA to `run_local_inertial_ba` once initialization succeeds.
+    /// Whether to switch local BA to `kornia_slam::mapping::bundle_adjustment::run_local_inertial_ba`
+    /// once initialization succeeds.
     /// Turning this off keeps the factors and the initializer (so gravity, velocities and bias
     /// are estimated and observable) while leaving the optimizer on the visual-only path — the
     /// setting to run first on hardware, because it cannot move a pose.
@@ -575,7 +577,7 @@ impl InertialConfig {
     /// Builds a config from the three things that must be measured: the extrinsic, the noise
     /// densities, and the device's sample rate.
     ///
-    /// Everything else is an algorithm threshold and gets `kornia_slam::pipeline`'s value.
+    /// Everything else is an algorithm threshold and gets `kornia_slam::SlamSystem`'s value.
     ///
     /// This is the ONLY constructor, and it is fallible, so that the checks below cannot be
     /// skipped by building the struct literally: every one of them guards a mistake whose
@@ -659,7 +661,7 @@ fn validate_rotation(r: &Mat3F64) -> Result<(), VioError> {
 pub struct InertialStats {
     /// Sample-buffer counters.
     pub buffer: ImuBufferStats,
-    /// IMU factors handed to `Map::add_imu_factor`.
+    /// IMU factors the map accepted (`Map::apply_insertion`).
     pub factors_added: u64,
     /// Intervals refused because the source reported dropped samples.
     pub refused_dropped: u64,
@@ -672,15 +674,23 @@ pub struct InertialStats {
     /// Intervals refused because `t1 <= t0`.
     pub refused_bad_interval: u64,
     /// Intervals where every gate passed but the integration still came back with `dt == 0`.
-    /// Should be unreachable behind the gates; counted because `add_imu_factor` does not check
-    /// it and `vi_ba_schur` answers a singular covariance with a 1e6-diagonal information
-    /// matrix rather than an error.
+    /// Should be unreachable behind the gates; counted because the map validates the factor's
+    /// interval but not its integrated `dt`, and `vi_ba_schur` answers a singular covariance with
+    /// a 1e6-diagonal information matrix rather than an error.
     pub refused_zero_dt: u64,
+    /// Intervals that passed every gate here but that `Map::apply_insertion` refused (an
+    /// endpoint keyframe the map does not hold, a duplicate edge, a non-increasing interval).
+    /// Unreachable from the tracker's own keyframe path; counted because the map validates.
+    pub refused_by_map: u64,
     /// Calls to `ImuInitializer::try_initialize`.
     pub init_attempts: u64,
     /// Accepted initializations, including the two later refinement passes (Campos et al.,
     /// ORB-SLAM3, IEEE T-RO 2021).
     pub init_accepted: u64,
+    /// Initializations the solver accepted but the map refused to apply
+    /// (`Map::apply_inertial_alignment`: a non-finite or invalid scale, rotation, velocity or
+    /// bias). The map is left untouched and the tracker stays visual-only.
+    pub init_apply_refused: u64,
     /// Whether visual-inertial initialization has succeeded.
     pub initialized: bool,
     /// Whether the first inertial refinement pass (after ~5 s of initialized tracking) has run.
@@ -705,6 +715,7 @@ impl InertialStats {
             + self.refused_no_samples
             + self.refused_bad_interval
             + self.refused_zero_dt
+            + self.refused_by_map
     }
 }
 

@@ -93,9 +93,10 @@ pub enum VioError {
     /// always a defect upstream and never a legal encoding. It is worth its own
     /// check because `Frame::stereo_depth` only tests `z > 0.0`: NaN fails that
     /// and is dropped safely, but `+inf` **passes**. `unproject_stereo` then
-    /// produces an infinite world point, and the NaNs it turns into propagate
-    /// through `run_local_ba` and poison every pose in the active window with
-    /// no way back. Rejecting the frame is far cheaper than diagnosing that.
+    /// produces an infinite world point. kornia-slam's map now refuses a
+    /// non-finite landmark and a non-finite BA result, but only by dropping that
+    /// point or that whole BA update — each one a counted refusal, not a
+    /// recoverable input. Rejecting the frame is far cheaper than diagnosing that.
     #[error("frame array `{field}` holds a non-finite value at index {index}: {value}")]
     NonFiniteFrameValue {
         /// Which per-keypoint array: `keypoints_xy`, `u_right` or `depth`.
