@@ -65,7 +65,8 @@ resources: [ ( id: "bus", provider: "cu_kornia_vio::VioBus" ) ],
 tasks: [
     ( id: "imu_feed", type: "cu_kornia_vio::ImuFeed<32>", resources: { "imu": "bus.imu" } ),
     ( id: "vio", type: "cu_kornia_vio::StereoVio", background: true,
-      config: { "on_tracking_loss": "reset_map", "max_keyframes": 120 },
+      config: { "on_tracking_loss": "reset_map", "max_keyframes": 120,
+                "orb_keypoints": 400, "pnp_lm_iterations": 5 },
       resources: { "imu": "bus.imu", "epoch": "bus.reset_epoch" } ),
 ],
 cnx: [
@@ -92,11 +93,12 @@ cnx: [
 
 Why the IMU does not ride a second input: `CuAsyncTask`, which `background: true` wraps a task
 in, accepts a single input message. And while a solve is running the background task refuses the
-arriving input, so an IMU batch bundled into the frame payload would be dropped along with most
-frames. Measured on a Jetson Orin with an OAK-D at 640x400 and 15 fps (`orb_keypoints: 400`,
+arriving input, so an IMU batch bundled into the frame payload would be dropped along with every
+refused frame. Measured on a Jetson Orin with an OAK-D at 640x400 and 15 fps (`orb_keypoints: 400`,
 `pnp_lm_iterations: 5`), tracking takes p50 53 ms / p99 91 ms and keyframe insertion p50 93 ms
-against a 66 ms frame interval, so poses come out at about 10.8 Hz and roughly one frame in
-four is refused.
+against a 66 ms frame interval, so poses come out at about 10.8 Hz and about 28 % of frames are
+refused. Those two keys are what the Wiring snippet sets; kornia-slam's own defaults (800
+keypoints, 50 LM iterations) are markedly slower and refuse more.
 
 `examples/stereo_vio.ron` is a complete graph on synthetic input:
 
@@ -177,7 +179,10 @@ It applies in three directions:
   must give them the identical URL and the identical `branch = "main"`. `cu-kornia-vio` reaches the
   payload crate by path, so it inherits the git source it was itself pulled from; pinning the
   payload line with `rev =` against a `branch =` on the other splits `StereoPair` in two. The
-  instinct to pin a payload crate is exactly the trap here.
+  instinct to pin a payload crate is exactly the trap here. The repo was renamed from
+  `kornia/cufx-vio`, and GitHub still redirects that URL, so it resolves: a dependency spelled
+  with the old URL next to one spelled with the new is the same split. Use
+  `https://github.com/kornia/cu-kornia-vio` everywhere.
 
 `Cargo.lock` is tracked so that a clean clone builds: it holds a kornia-rs / kornia-slam pair
 known to compile together. A consumer's own lock still wins.

@@ -6,13 +6,14 @@
 //! `background: true` wraps a task in, is implemented only for
 //! `T: CuTask<Input<'i> = CuMsg<I>>`. A second edge would un-background the solve, and the solve
 //! costs p50 53 ms / p99 91 ms, and p50 93 ms on a keyframe, against a 66 ms frame interval
-//! (measured on a Jetson Orin with an OAK-D at 640x400): inline, it holds every other task in the
-//! graph behind it.
+//! (measured on a Jetson Orin with an OAK-D at 640x400 with `orb_keypoints: 400` and
+//! `pnp_lm_iterations: 5`; kornia-slam's defaults are slower): inline, it holds every other task
+//! in the graph behind it.
 //!
 //! Bundling the samples into the `StereoPair` payload keeps one input, and costs only ~2 % of the
 //! payload, but puts the inertial stream on the ONE edge that is designed to drop: `CuAsyncTask`
 //! discards the arriving input while the previous solve is `Running`, and again while `Waiting`
-//! for the length of that solve, so roughly one frame in four is refused, taking its samples
+//! for the length of that solve, so about 28 % of frames are refused even tuned, taking their samples
 //! with them, with the producer's drop counter reading 0 because the SOURCE dropped nothing.
 //! `from_measurements` then turns the decimated remainder into a full-`dt` delta at the wrong
 //! magnitude. The inertial stream must not ride the dropping edge.

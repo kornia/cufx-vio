@@ -96,9 +96,9 @@ pub mod vio_resources {
 ///
 /// The inertial samples do not ride a second input, and are not bundled into the frame payload
 /// either: `CuAsyncTask` refuses the arriving input while the previous solve is `Running` and
-/// again while `Waiting`, so with a solve that overruns the 66 ms frame interval on keyframes
-/// and at its tail, roughly one frame in four is dropped, and a payload-borne batch would be
-/// dropped with them. Samples
+/// again while `Waiting`. The solve overruns the 66 ms frame interval on keyframes and at its
+/// tail, so even tuned (`orb_keypoints: 400`, `pnp_lm_iterations: 5`: 10.8 Hz of poses from 15
+/// fps) about 28 % of frames are dropped, and a payload-borne batch would be dropped with them. Samples
 /// arrive through the bus's [`ImuQueue`] instead, pushed by an inline
 /// [`ImuFeed`](crate::ImuFeed); see [`crate::imu_channel`] for what that costs in replay
 /// fidelity. The queue is armed only when this task has an `inertial` block: without one,

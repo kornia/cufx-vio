@@ -34,6 +34,8 @@
             config: {
                 "on_tracking_loss": "reset_map",
                 "max_keyframes": 120,
+                "orb_keypoints": 400,
+                "pnp_lm_iterations": 5,
             },
             resources: {
                 "imu": "bus.imu",
