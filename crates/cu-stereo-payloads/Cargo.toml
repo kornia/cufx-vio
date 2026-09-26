@@ -6,7 +6,7 @@ license = "Apache-2.0"
 authors = ["Edgar Riba <edgar.riba@gmail.com>"]
 publish = false
 description = "Stereo, inertial and pose payloads for a Copper visual-inertial graph"
-repository = "https://github.com/kornia/cufx-vio"
+repository = "https://github.com/kornia/cu-kornia-vio"
 keywords = ["copper", "stereo", "imu", "vio", "robotics"]
 categories = ["science::robotics"]
 

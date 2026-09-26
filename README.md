@@ -49,8 +49,8 @@ both crates with the identical spec string; see [the spec-string rule](#the-spec
 
 ```toml
 [dependencies]
-cu-kornia-vio = { git = "https://github.com/kornia/cufx-vio", branch = "main" }
-cu-stereo-payloads = { git = "https://github.com/kornia/cufx-vio", branch = "main" }
+cu-kornia-vio = { git = "https://github.com/kornia/cu-kornia-vio", branch = "main" }
+cu-stereo-payloads = { git = "https://github.com/kornia/cu-kornia-vio", branch = "main" }
 cu29 = { git = "https://github.com/copper-project/copper-rs", rev = "fe2061dc10539868334f6ded55a9e75feb0f2b62" }
 ```
 
