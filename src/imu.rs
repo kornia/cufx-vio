@@ -62,7 +62,7 @@ use crate::error::VioError;
 /// silently offset from the frames it is supposed to span, whereupon its own filter drops every
 /// sample and the edge becomes the zero-delta case above.
 ///
-/// Crate-private: the public edge takes the unit-typed [`cufx_sensor_payloads::ImuSample`] and
+/// Crate-private: the public edge takes the unit-typed [`cu_stereo_payloads::ImuSample`] and
 /// converts once, on ingest.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RawImuSample {
@@ -90,12 +90,12 @@ impl RawImuSample {
     }
 }
 
-impl From<cufx_sensor_payloads::ImuSample> for RawImuSample {
+impl From<cu_stereo_payloads::ImuSample> for RawImuSample {
     /// Unpacks the unit-typed payload into the tracker's plain-`f64` sample: the stamp is the
     /// sample's own `tov` (the same clock as the images'), the units are rad/s and m/s^2. A
     /// `From` so a producer on the IMU-rate path can hand a batch straight through
     /// [`ImuQueue::push`](crate::ImuQueue::push) with no intermediate `Vec`.
-    fn from(s: cufx_sensor_payloads::ImuSample) -> Self {
+    fn from(s: cu_stereo_payloads::ImuSample) -> Self {
         let a = |q: Acceleration| f64::from(q.get::<meter_per_second_squared>());
         let w = |q: AngularVelocity| f64::from(q.get::<radian_per_second>());
         Self {
@@ -109,10 +109,10 @@ impl From<cufx_sensor_payloads::ImuSample> for RawImuSample {
 /// Samples held by a ring — `ImuBuffer` and [`crate::ImuQueue`] alike.
 ///
 /// 2048 = 10.2 s at 200 Hz, ~115 kB. Sized against the LONGEST interval that can be asked for,
-/// not the frame interval: a keyframe edge spans back to the previous keyframe, keyframe
-/// insertion measures p50 596 ms / p99 1020 ms on a Jetson Orin with an OAK-D at 640x400, and
-/// the channel has to hold what arrives while the tracker is mid-solve and not draining. One
-/// constant for both rings so they cannot drift apart in size with nothing noticing.
+/// not the frame interval: a keyframe edge spans back to the previous keyframe, keyframes can be
+/// seconds apart when the scene barely changes, and the channel has to hold what arrives while
+/// the tracker is mid-solve and not draining. One constant for both rings so they cannot drift
+/// apart in size with nothing noticing.
 pub const DEFAULT_BUFFER_CAPACITY: usize = 2048;
 
 /// Appends to a capacity-bounded ring, evicting the oldest sample and counting the eviction.

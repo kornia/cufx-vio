@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
+use cu_stereo_payloads::ImuBatch;
 use cu29::prelude::*;
-use cufx_sensor_payloads::ImuBatch;
 
 use crate::imu_channel::ImuQueue;
 
@@ -29,7 +29,7 @@ pub mod feed_resources {
 /// a logged graph edge. Until a `StereoVio` with an `inertial` block arms the queue, a push is a
 /// single atomic load.
 ///
-/// `N` is the source's batch capacity; the RON names it, as in `cufx_vio::ImuFeed<32>`.
+/// `N` is the source's batch capacity; the RON names it, as in `cu_kornia_vio::ImuFeed<32>`.
 #[derive(Reflect)]
 #[reflect(no_field_bounds, from_reflect = false)]
 pub struct ImuFeed<const N: usize> {
@@ -48,7 +48,7 @@ impl<const N: usize> CuSinkTask for ImuFeed<N> {
     where
         Self: Sized,
     {
-        crate::config::deny_unknown_keys(config, "cufx_vio::ImuFeed", &[])?;
+        crate::config::deny_unknown_keys(config, "cu_kornia_vio::ImuFeed", &[])?;
         Ok(Self { imu: resources.imu })
     }
 
@@ -68,8 +68,8 @@ impl<const N: usize> CuSinkTask for ImuFeed<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cu_stereo_payloads::{ImuPayload, ImuSample};
     use cu29::clock::CuTime;
-    use cufx_sensor_payloads::{ImuPayload, ImuSample};
 
     fn feed() -> (ImuFeed<4>, Arc<ImuQueue>) {
         let imu = Arc::new(ImuQueue::new());

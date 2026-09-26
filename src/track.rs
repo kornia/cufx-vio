@@ -101,7 +101,7 @@ use crate::imu::{
     ImuBuffer, ImuWindowError, InertialConfig, InertialStats, RawImuSample, WindowExcitation,
     ts_sec, window_excitation,
 };
-use cufx_sensor_payloads::ImuSample;
+use cu_stereo_payloads::ImuSample;
 
 /// Close-depth threshold in baselines: the near/far split is `35 * baseline`
 /// metres (the stereo close/far split of Campos et al., ORB-SLAM3, IEEE T-RO
@@ -621,12 +621,12 @@ impl Tracker {
         // Startup log mirrors upstream's: a wrong baseline is invisible in the
         // output but corrupts metric scale and the near/far split at once.
         info!(
-            "cufx-vio stereo tracker configured: fx={} fy={} cx={} cy={} baseline_m={} bf={} close_depth_m={}",
+            "cu-kornia-vio stereo tracker configured: fx={} fy={} cx={} cy={} baseline_m={} bf={} close_depth_m={}",
             camera.fx, camera.fy, camera.cx, camera.cy, baseline_m, stereo_config.bf, close_depth_m
         );
         if let Err(e) = validate_camera(&camera, baseline_m) {
             error!(
-                "cufx-vio tracker configuration is invalid: {}",
+                "cu-kornia-vio tracker configuration is invalid: {}",
                 e.to_string()
             );
         }
@@ -636,7 +636,7 @@ impl Tracker {
             // Loud at startup, because from here on the only externally visible difference is
             // that the world gets rotated once, silently, when initialization succeeds.
             warning!(
-                "cufx-vio INERTIAL path enabled: poses are only as good as the configured \
+                "cu-kornia-vio INERTIAL path enabled: poses are only as good as the configured \
                  imu_t_bc, which nothing downstream can validate (gyro_noise={} accel_noise={} \
                  gyro_bias_noise={} accel_bias_noise={} rate_hz={} inertial_ba={})",
                 inert.cfg.calib.gyro_noise,
@@ -807,7 +807,7 @@ impl Tracker {
                 // keeps tracking visually throughout and runs the initializer as a side effect
                 // of keyframe insertion, so the mode is never entered even with the inertial
                 // path on. Recover rather than panic on a live stream.
-                error!("cufx-vio reached SystemMode::ImuInit, which neither path ever sets");
+                error!("cu-kornia-vio reached SystemMode::ImuInit, which neither path ever sets");
                 self.state.mode = SystemMode::Bootstrap;
                 self.bootstrap_stereo(frame, ts_sec, stamp_ns)
             }
@@ -3368,7 +3368,7 @@ mod tests {
     /// must land in the ring unchanged.
     #[test]
     fn test_push_imu_accepts_payload_samples() {
-        use cufx_sensor_payloads::ImuPayload;
+        use cu_stereo_payloads::ImuPayload;
 
         let mut tracker = tracker_with_inertial();
         let payload = (0..3u64).map(|i| ImuSample {

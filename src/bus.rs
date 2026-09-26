@@ -7,11 +7,11 @@
 //! RON binds them by name, so two estimators in one graph get two buses.
 //!
 //! ```ron
-//! resources: [ ( id: "bus", provider: "cufx_vio::VioBus" ) ],
+//! resources: [ ( id: "bus", provider: "cu_kornia_vio::VioBus" ) ],
 //! tasks: [
-//!     ( id: "imu_feed", type: "cufx_vio::ImuFeed<32>",
+//!     ( id: "imu_feed", type: "cu_kornia_vio::ImuFeed<32>",
 //!       resources: { "imu": "bus.imu" } ),
-//!     ( id: "vio", type: "cufx_vio::StereoVio", background: true,
+//!     ( id: "vio", type: "cu_kornia_vio::StereoVio", background: true,
 //!       resources: { "imu": "bus.imu", "epoch": "bus.reset_epoch" } ),
 //! ],
 //! ```
@@ -46,7 +46,7 @@ impl ResourceBundle for VioBus {
         config: Option<&ComponentConfig>,
         manager: &mut ResourceManager,
     ) -> CuResult<()> {
-        crate::config::deny_unknown_keys(config, "cufx_vio::VioBus", &[])?;
+        crate::config::deny_unknown_keys(config, "cu_kornia_vio::VioBus", &[])?;
         manager.add_shared(bundle.key(VioBusId::Imu), Arc::new(ImuQueue::new()))?;
         manager.add_shared(
             bundle.key(VioBusId::ResetEpoch),

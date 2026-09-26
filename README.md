@@ -1,4 +1,4 @@
-# cufx-vio
+# cu-kornia-vio
 
 [Copper](https://github.com/copper-project/copper-rs) tasks wrapping
 [kornia-slam](https://github.com/kornia/kornia-slam) stereo visual-inertial odometry.
@@ -9,13 +9,13 @@ input edge and can run with `background: true`.
 
 ## Crates
 
-- **`cufx-vio`**: the tasks (`StereoVio`, `ImuFeed`) and the `VioBus` resource bundle.
-- **`cufx-sensor-payloads`**: the wire types alone. It depends on cu29, the upstream copper
+- **`cu-kornia-vio`**: the tasks (`StereoVio`, `ImuFeed`) and the `VioBus` resource bundle.
+- **`cu-stereo-payloads`**: the wire types alone. It depends on cu29, the upstream copper
   payload crates, bincode and serde and nothing else, so a stereo driver can name the types it
-  produces without depending on `cufx-vio` and, through it, on kornia-slam. That is the whole
+  produces without depending on `cu-kornia-vio` and, through it, on kornia-slam. That is the whole
   reason it is a separate crate rather than a module.
 
-Inside `cufx-vio` there are two layers:
+Inside `cu-kornia-vio` there are two layers:
 
 - **`track`**: the composition root over kornia-slam. kornia-slam ships stereo matching, the
   map, map-projection PnP and bundle adjustment; this is the orchestration over them, written for
@@ -27,7 +27,7 @@ Inside `cufx-vio` there are two layers:
 
 ## Payload types
 
-All from `cufx-sensor-payloads`. Time rides on the message `tov`, never in the payload.
+All from `cu-stereo-payloads`. Time rides on the message `tov`, never in the payload.
 
 | Type | Carries | `tov` |
 |---|---|---|
@@ -49,29 +49,29 @@ both crates with the identical spec string; see [the spec-string rule](#the-spec
 
 ```toml
 [dependencies]
-cufx-vio = { git = "https://github.com/kornia/cufx-vio", branch = "main" }
-cufx-sensor-payloads = { git = "https://github.com/kornia/cufx-vio", branch = "main" }
+cu-kornia-vio = { git = "https://github.com/kornia/cufx-vio", branch = "main" }
+cu-stereo-payloads = { git = "https://github.com/kornia/cufx-vio", branch = "main" }
 cu29 = { git = "https://github.com/copper-project/copper-rs", rev = "fe2061dc10539868334f6ded55a9e75feb0f2b62" }
 ```
 
-A stereo driver that only produces frames needs `cufx-sensor-payloads` alone. It must fill a
+A stereo driver that only produces frames needs `cu-stereo-payloads` alone. It must fill a
 `StereoPair` with rectified GRAY8 eyes and stamp the message `tov` with the capture time; an
 untimed frame (`Tov::None`) is refused.
 
 ## Wiring
 
 ```ron
-resources: [ ( id: "bus", provider: "cufx_vio::VioBus" ) ],
+resources: [ ( id: "bus", provider: "cu_kornia_vio::VioBus" ) ],
 tasks: [
-    ( id: "imu_feed", type: "cufx_vio::ImuFeed<32>", resources: { "imu": "bus.imu" } ),
-    ( id: "vio", type: "cufx_vio::StereoVio", background: true,
+    ( id: "imu_feed", type: "cu_kornia_vio::ImuFeed<32>", resources: { "imu": "bus.imu" } ),
+    ( id: "vio", type: "cu_kornia_vio::StereoVio", background: true,
       config: { "on_tracking_loss": "reset_map", "max_keyframes": 120 },
       resources: { "imu": "bus.imu", "epoch": "bus.reset_epoch" } ),
 ],
 cnx: [
-    ( src: "stereo", dst: "vio", msg: "cufx_sensor_payloads::StereoPair" ),
-    ( src: "imu", dst: "imu_feed", msg: "cufx_sensor_payloads::ImuBatch<32>" ),
-    ( src: "vio", dst: "poses", msg: "cufx_sensor_payloads::VioPose" ),
+    ( src: "stereo", dst: "vio", msg: "cu_stereo_payloads::StereoPair" ),
+    ( src: "imu", dst: "imu_feed", msg: "cu_stereo_payloads::ImuBatch<32>" ),
+    ( src: "vio", dst: "poses", msg: "cu_stereo_payloads::VioPose" ),
 ],
 ```
 
@@ -85,7 +85,7 @@ cnx: [
   frame. Unknown config keys are refused at startup rather than ignored. The recognised keys are
   `on_tracking_loss` (`keep_map`, the default, or `reset_map` for a long-running graph),
   `max_keyframes`, `orb_keypoints`, `search_radius_px`, `max_covisible_keyframes`,
-  `pnp_lm_iterations`, `inertial` and `landmark_buffers`; `cufx_vio::config::CONFIG_KEYS` lists
+  `pnp_lm_iterations`, `inertial` and `landmark_buffers`; `cu_kornia_vio::config::CONFIG_KEYS` lists
   them. Its `Freezable` is a no-op (the kornia-slam map has no
   serialised form), so a resim of a `background: true` graph reproduces it only from the start of
   a log; see Known limitations.
@@ -93,8 +93,10 @@ cnx: [
 Why the IMU does not ride a second input: `CuAsyncTask`, which `background: true` wraps a task
 in, accepts a single input message. And while a solve is running the background task refuses the
 arriving input, so an IMU batch bundled into the frame payload would be dropped along with most
-frames. Measured on a Jetson Orin with an OAK-D at 640x400, a 596 ms p50 solve against a 66 ms
-frame interval refuses roughly nine frames in ten.
+frames. Measured on a Jetson Orin with an OAK-D at 640x400 and 15 fps (`orb_keypoints: 400`,
+`pnp_lm_iterations: 5`), tracking takes p50 53 ms / p99 91 ms and keyframe insertion p50 93 ms
+against a 66 ms frame interval, so poses come out at about 10.8 Hz and roughly one frame in
+four is refused.
 
 `examples/stereo_vio.ron` is a complete graph on synthetic input:
 
@@ -147,7 +149,7 @@ config: {
 },
 ```
 
-The rustdoc of `cufx_vio::config` explains each field and why no default is defensible.
+The rustdoc of `cu_kornia_vio::config` explains each field and why no default is defensible.
 
 ## Documentation and development
 
@@ -171,8 +173,8 @@ It applies in three directions:
 - **kornia**: every consumer must spell `branch = "main"` identically for the four kornia-rs
   crates, and `branch = "develop"` for `kornia-slam` AND `kornia-sensors` (the latter is a
   workspace member of the kornia-slam repo, not of kornia-rs).
-- **this repo's own two crates**: a consumer naming both `cufx-vio` and `cufx-sensor-payloads`
-  must give them the identical URL and the identical `branch = "main"`. `cufx-vio` reaches the
+- **this repo's own two crates**: a consumer naming both `cu-kornia-vio` and `cu-stereo-payloads`
+  must give them the identical URL and the identical `branch = "main"`. `cu-kornia-vio` reaches the
   payload crate by path, so it inherits the git source it was itself pulled from; pinning the
   payload line with `rev =` against a `branch =` on the other splits `StereoPair` in two. The
   instinct to pin a payload crate is exactly the trap here.

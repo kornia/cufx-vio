@@ -72,7 +72,7 @@ pub(crate) fn optional_positive_usize(
 ///
 /// ```ron
 /// ( id: "vio",
-///   type: "cufx_vio::StereoVio",
+///   type: "cu_kornia_vio::StereoVio",
 ///   config: {
 ///     "inertial": (
 ///       // R_BC, ROW-major, mapping camera axes into IMU/body axes: X_body = R_BC * X_cam.

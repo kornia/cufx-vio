@@ -504,6 +504,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cu-kornia-vio"
+version = "0.1.0"
+dependencies = [
+ "cu-spatial-payloads",
+ "cu-stereo-payloads",
+ "cu29",
+ "cu29-build",
+ "cu29-export",
+ "kornia-3d",
+ "kornia-algebra",
+ "kornia-image",
+ "kornia-imgproc",
+ "kornia-sensors",
+ "kornia-slam",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "cu-sensor-payloads"
 version = "1.3.0-dev"
 source = "git+https://github.com/copper-project/copper-rs?rev=fe2061dc10539868334f6ded55a9e75feb0f2b62#fe2061dc10539868334f6ded55a9e75feb0f2b62"
@@ -525,6 +544,17 @@ dependencies = [
  "cu29-soa-derive",
  "glam 0.33.7",
  "libm",
+ "serde",
+]
+
+[[package]]
+name = "cu-stereo-payloads"
+version = "0.1.0"
+dependencies = [
+ "cu-bincode",
+ "cu-sensor-payloads",
+ "cu-spatial-payloads",
+ "cu29",
  "serde",
 ]
 
@@ -765,36 +795,6 @@ dependencies = [
  "cu29-clock",
  "ordered-float",
  "serde",
-]
-
-[[package]]
-name = "cufx-sensor-payloads"
-version = "0.1.0"
-dependencies = [
- "cu-bincode",
- "cu-sensor-payloads",
- "cu-spatial-payloads",
- "cu29",
- "serde",
-]
-
-[[package]]
-name = "cufx-vio"
-version = "0.1.0"
-dependencies = [
- "cu-spatial-payloads",
- "cu29",
- "cu29-build",
- "cu29-export",
- "cufx-sensor-payloads",
- "kornia-3d",
- "kornia-algebra",
- "kornia-image",
- "kornia-imgproc",
- "kornia-sensors",
- "kornia-slam",
- "serde",
- "thiserror 2.0.20",
 ]
 
 [[package]]

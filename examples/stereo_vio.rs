@@ -15,12 +15,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use cu_stereo_payloads::{
+    ImuBatch, ImuPayload, ImuSample, RectifiedStereo, StereoPair, VioPose, gray8_format,
+};
 use cu29::prelude::*;
 use cu29::units::si::f64::Length;
 use cu29::units::si::length::meter;
-use cufx_sensor_payloads::{
-    ImuBatch, ImuPayload, ImuSample, RectifiedStereo, StereoPair, VioPose, gray8_format,
-};
 
 #[copper_runtime(config = "examples/stereo_vio.ron")]
 struct App {}
