@@ -7,6 +7,8 @@ authors = ["Edgar Riba <edgar.riba@gmail.com>"]
 publish = false
 description = "Stereo, inertial and pose payloads for a Copper visual-inertial graph"
 repository = "https://github.com/kornia/cufx-vio"
+keywords = ["copper", "stereo", "imu", "vio", "robotics"]
+categories = ["science::robotics"]
 
 # The copper component catalog scrapes this.
 [package.metadata.copper]

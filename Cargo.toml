@@ -35,6 +35,9 @@ authors = ["Edgar Riba <edgar.riba@gmail.com>"]
 publish = false
 description = "Copper tasks wrapping kornia-slam stereo visual-inertial odometry"
 repository = "https://github.com/kornia/cufx-vio"
+readme = "README.md"
+keywords = ["copper", "vio", "slam", "stereo", "robotics"]
+categories = ["science::robotics", "computer-vision"]
 
 # The copper component catalog scrapes this.
 [package.metadata.copper]
